@@ -55,14 +55,24 @@ class NoamScheduler:
         return lr
 
 
-def save_checkpoint(ckpt_dir, name, model, config, epoch, metric):
+def save_checkpoint(ckpt_dir, name, model, optimizer, scheduler, config, epoch, metric):
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save({
         "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_step": scheduler.step_num,
         "config": config,
         "epoch": epoch,
         "metric": metric,
     }, os.path.join(ckpt_dir, name))
+
+
+def load_resume(resume_path):
+    """Loads a checkpoint dict to resume from, or returns None if no path was given."""
+    if resume_path is None:
+        return None
+    print(f"Resuming from {resume_path} ...")
+    return torch.load(resume_path, map_location=DEVICE)
 
 
 # =========================================================================== #
@@ -109,26 +119,42 @@ def train_encdec(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
+    resume_ckpt = load_resume(args.resume)
+    # if resuming, architecture must match the saved checkpoint - CLI arch flags are ignored
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
+
     model = Transformer(
         src_vocab_size=meta["src_vocab_size"],
         tgt_vocab_size=meta["tgt_vocab_size"],
-        d_model=args.d_model, num_layers=args.num_layers, num_heads=args.num_heads,
-        d_ff=args.d_ff, max_len=meta["max_len"] + 10, dropout=args.dropout, pad_idx=pad_idx,
+        d_model=arch["d_model"], num_layers=arch["num_layers"], num_heads=arch["num_heads"],
+        d_ff=arch["d_ff"], max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamScheduler(optimizer, args.d_model, args.warmup_steps)
+    scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
 
     config = {
-        "mode": "encdec", "d_model": args.d_model, "num_layers": args.num_layers,
-        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "mode": "encdec", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "src_vocab_size": meta["src_vocab_size"], "tgt_vocab_size": meta["tgt_vocab_size"],
         "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
     }
 
+    start_epoch = 1
     best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val = resume_ckpt["metric"]
+        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
 
         model.train()
@@ -168,10 +194,10 @@ def train_encdec(args):
               f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
               f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, config, epoch, val_loss)
+        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, config, epoch, val_loss)
+            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
             print(f"  -> new best (val_loss={val_loss:.4f})")
 
 
@@ -215,24 +241,39 @@ def train_decoder(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
+    resume_ckpt = load_resume(args.resume)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
+
     model = TransformerDecoderOnly(
-        vocab_size=meta["vocab_size"], d_model=args.d_model, num_layers=args.num_layers,
-        num_heads=args.num_heads, d_ff=args.d_ff, max_len=max_len,
-        dropout=args.dropout, pad_idx=pad_idx,
+        vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=max_len,
+        dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamScheduler(optimizer, args.d_model, args.warmup_steps)
+    scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
 
     config = {
-        "mode": "decoder", "d_model": args.d_model, "num_layers": args.num_layers,
-        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "mode": "decoder", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": max_len, "pad_idx": pad_idx,
     }
 
+    start_epoch = 1
     best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val = resume_ckpt["metric"]
+        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
 
         model.train()
@@ -272,10 +313,10 @@ def train_decoder(args):
               f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
               f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, config, epoch, val_loss)
+        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, config, epoch, val_loss)
+            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
             print(f"  -> new best (val_loss={val_loss:.4f})")
 
 
@@ -319,27 +360,43 @@ def train_encoder_classify(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
+    resume_ckpt = load_resume(args.resume)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "pooling": args.pooling,
+    }
+
     model = TransformerEncoderOnly(
-        vocab_size=meta["vocab_size"], d_model=args.d_model, num_layers=args.num_layers,
-        num_heads=args.num_heads, d_ff=args.d_ff, max_len=meta["max_len"] + 10,
-        dropout=args.dropout, pad_idx=pad_idx, num_classes=meta["num_classes"],
-        pooling=args.pooling,
+        vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=meta["max_len"] + 10,
+        dropout=arch["dropout"], pad_idx=pad_idx, num_classes=meta["num_classes"],
+        pooling=arch["pooling"],
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamScheduler(optimizer, args.d_model, args.warmup_steps)
+    scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
 
     config = {
-        "mode": "encoder_classify", "d_model": args.d_model, "num_layers": args.num_layers,
-        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "mode": "encoder_classify", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
-        "num_classes": meta["num_classes"], "pooling": args.pooling,
+        "num_classes": meta["num_classes"], "pooling": arch["pooling"],
         "label_names": meta.get("label_names"),
     }
 
+    start_epoch = 1
     best_val_acc = 0.0
-    for epoch in range(1, args.epochs + 1):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val_acc = resume_ckpt["metric"]
+        print(f"Resumed at epoch {start_epoch} (previous val_acc={best_val_acc:.3f})")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
 
         model.train()
@@ -378,10 +435,10 @@ def train_encoder_classify(args):
         print(f"[encoder/classify] epoch {epoch:02d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
               f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, config, epoch, val_acc)
+        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_acc)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            save_checkpoint(ckpt_dir, "best.pt", model, config, epoch, val_acc)
+            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_acc)
             print(f"  -> new best (val_acc={val_acc:.3f})")
 
 
@@ -451,24 +508,39 @@ def train_encoder_mlm(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
+    resume_ckpt = load_resume(args.resume)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
+
     model = TransformerEncoderOnly(
-        vocab_size=meta["vocab_size"], d_model=args.d_model, num_layers=args.num_layers,
-        num_heads=args.num_heads, d_ff=args.d_ff, max_len=max_len,
-        dropout=args.dropout, pad_idx=pad_idx,
+        vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=max_len,
+        dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamScheduler(optimizer, args.d_model, args.warmup_steps)
+    scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
 
     config = {
-        "mode": "encoder_mlm", "d_model": args.d_model, "num_layers": args.num_layers,
-        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "mode": "encoder_mlm", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": max_len, "pad_idx": pad_idx,
     }
 
+    start_epoch = 1
     best_val = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val = resume_ckpt["metric"]
+        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
 
         model.train()
@@ -507,10 +579,10 @@ def train_encoder_mlm(args):
         print(f"[encoder/mlm] epoch {epoch:02d} | train_loss {train_loss:.4f} "
               f"| val_loss {val_loss:.4f} | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, config, epoch, val_loss)
+        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, config, epoch, val_loss)
+            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
             print(f"  -> new best (val_loss={val_loss:.4f})")
 
 
@@ -525,6 +597,10 @@ def build_arg_parser():
 
     p.add_argument("--data-root", default="data", dest="data_root")
     p.add_argument("--ckpt-root", default="checkpoints", dest="ckpt_root")
+    p.add_argument("--resume", default=None,
+                   help="path to a checkpoint to resume from, e.g. checkpoints/decoder/last.pt "
+                        "(architecture flags below are ignored when resuming - the checkpoint's "
+                        "own config is used instead)")
 
     p.add_argument("--d-model", type=int, default=256, dest="d_model")
     p.add_argument("--num-layers", type=int, default=4, dest="num_layers")
