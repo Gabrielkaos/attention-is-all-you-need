@@ -1,0 +1,388 @@
+"""
+inference.py
+------------
+Loads a checkpoint from train.py + the matching vocab(s) from
+data_cleaning.py, and lets you play with whichever model you trained.
+
+    python inference.py --mode encdec                              # translate, REPL
+    python inference.py --mode encdec --beam 5                     # beam search
+    python inference.py --mode decoder                              # generate text, REPL
+    python inference.py --mode decoder --text "once upon a"        # one-shot
+    python inference.py --mode encoder_classify                     # classify, REPL
+    python inference.py --mode encoder_mlm                          # fill-in-the-blank, REPL
+                                                                      (use ___ as the blank)
+
+Every mode reuses clean_text/tokenize from data_cleaning.py so the
+preprocessing at inference time matches training exactly.
+"""
+
+import os
+import json
+import argparse
+
+import torch
+
+from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly
+from data_cleaning import clean_text, tokenize
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DEFAULT_CKPT = {
+    "encdec": os.path.join("checkpoints", "encdec", "best.pt"),
+    "decoder": os.path.join("checkpoints", "decoder", "best.pt"),
+    "encoder_classify": os.path.join("checkpoints", "encoder_classify", "best.pt"),
+    "encoder_mlm": os.path.join("checkpoints", "encoder_mlm", "best.pt"),
+}
+DEFAULT_DATA_DIR = {
+    "encdec": os.path.join("data", "encdec"),
+    "decoder": os.path.join("data", "decoder"),
+    "encoder_classify": os.path.join("data", "encoder_classify"),
+    "encoder_mlm": os.path.join("data", "encoder_mlm"),
+}
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers
+# --------------------------------------------------------------------------- #
+def load_vocab(path):
+    with open(path, "r", encoding="utf-8") as f:
+        itos = json.load(f)
+    stoi = {tok: i for i, tok in enumerate(itos)}
+    return itos, stoi
+
+
+def load_checkpoint(ckpt_path, expected_mode):
+    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    cfg = ckpt["config"]
+    if cfg.get("mode") != expected_mode:
+        print(f"warning: checkpoint was trained as mode='{cfg.get('mode')}', "
+              f"but you asked for '{expected_mode}' - loading anyway.")
+    print(f"Loaded {ckpt_path} (epoch {ckpt['epoch']}, metric={ckpt['metric']:.4f})")
+    return ckpt, cfg
+
+
+def encode_tokens(sentence, stoi, unk_idx):
+    toks = tokenize(clean_text(sentence))
+    return toks, [stoi.get(tok, unk_idx) for tok in toks]
+
+
+# =========================================================================== #
+# MODE: encdec (translation)
+# =========================================================================== #
+def build_encdec_model(cfg):
+    return Transformer(
+        src_vocab_size=cfg["src_vocab_size"], tgt_vocab_size=cfg["tgt_vocab_size"],
+        d_model=cfg["d_model"], num_layers=cfg["num_layers"], num_heads=cfg["num_heads"],
+        d_ff=cfg["d_ff"], max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+    ).to(DEVICE)
+
+
+@torch.no_grad()
+def greedy_translate(model, src_ids, sos_idx, eos_idx, max_len=100):
+    src = torch.tensor([src_ids], dtype=torch.long, device=DEVICE)
+    enc_out, src_mask = model.encode(src)
+    tgt = torch.tensor([[sos_idx]], dtype=torch.long, device=DEVICE)
+
+    for _ in range(max_len):
+        logits = model.decode(tgt, enc_out, src_mask)
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        tgt = torch.cat([tgt, next_token], dim=1)
+        if next_token.item() == eos_idx:
+            break
+    return tgt.squeeze(0).tolist()
+
+
+@torch.no_grad()
+def beam_translate(model, src_ids, sos_idx, eos_idx, beam_size=5, max_len=100, length_penalty=0.7):
+    src = torch.tensor([src_ids], dtype=torch.long, device=DEVICE)
+    enc_out, src_mask = model.encode(src)
+
+    beams = [([sos_idx], 0.0, False)]
+    for _ in range(max_len):
+        candidates = []
+        for tokens, score, finished in beams:
+            if finished:
+                candidates.append((tokens, score, finished))
+                continue
+            tgt = torch.tensor([tokens], dtype=torch.long, device=DEVICE)
+            logits = model.decode(tgt, enc_out, src_mask)
+            log_probs = torch.log_softmax(logits[:, -1, :], dim=-1).squeeze(0)
+            top_lp, top_idx = log_probs.topk(beam_size)
+            for lp, idx in zip(top_lp.tolist(), top_idx.tolist()):
+                candidates.append((tokens + [idx], score + lp, idx == eos_idx))
+
+        candidates.sort(key=lambda c: c[1] / (len(c[0]) ** length_penalty), reverse=True)
+        beams = candidates[:beam_size]
+        if all(b[2] for b in beams):
+            break
+
+    return beams[0][0]
+
+
+def ids_to_words(ids, itos, sos_idx, eos_idx, pad_idx):
+    words = []
+    for i in ids:
+        if i in (sos_idx, pad_idx):
+            continue
+        if i == eos_idx:
+            break
+        words.append(itos[i])
+    return " ".join(words)
+
+
+def run_encdec(args):
+    data_dir = args.data_dir or DEFAULT_DATA_DIR["encdec"]
+    ckpt_path = args.ckpt or DEFAULT_CKPT["encdec"]
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    src_itos, src_stoi = load_vocab(os.path.join(data_dir, "src_vocab.json"))
+    tgt_itos, tgt_stoi = load_vocab(os.path.join(data_dir, "tgt_vocab.json"))
+
+    ckpt, cfg = load_checkpoint(ckpt_path, "encdec")
+    model = build_encdec_model(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    sos_idx, eos_idx, pad_idx, unk_idx = meta["sos_idx"], meta["eos_idx"], meta["pad_idx"], meta["unk_idx"]
+
+    def translate_once(sentence):
+        _, src_ids = encode_tokens(sentence, src_stoi, unk_idx)
+        if args.beam > 0:
+            out_ids = beam_translate(model, src_ids, sos_idx, eos_idx, beam_size=args.beam)
+        else:
+            out_ids = greedy_translate(model, src_ids, sos_idx, eos_idx)
+        return ids_to_words(out_ids, tgt_itos, sos_idx, eos_idx, pad_idx)
+
+    if args.text:
+        print(translate_once(args.text))
+        return
+
+    mode_desc = f"beam search (k={args.beam})" if args.beam > 0 else "greedy"
+    print(f"\nTranslate {meta['src_lang']} -> {meta['tgt_lang']} ({mode_desc}). Type 'quit' to exit.\n")
+    while True:
+        sentence = input(f"[{meta['src_lang']}] > ").strip()
+        if sentence.lower() in ("quit", "exit"):
+            break
+        if not sentence:
+            continue
+        print(f"[{meta['tgt_lang']}] > {translate_once(sentence)}\n")
+
+
+# =========================================================================== #
+# MODE: decoder (GPT-style generation)
+# =========================================================================== #
+def build_decoder_model(cfg):
+    return TransformerDecoderOnly(
+        vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
+        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+    ).to(DEVICE)
+
+
+def run_decoder(args):
+    data_dir = args.data_dir or DEFAULT_DATA_DIR["decoder"]
+    ckpt_path = args.ckpt or DEFAULT_CKPT["decoder"]
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+
+    ckpt, cfg = load_checkpoint(ckpt_path, "decoder")
+    model = build_decoder_model(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    unk_idx, eos_idx = meta["unk_idx"], meta["eos_idx"]
+
+    def generate_once(prompt):
+        _, prompt_ids = encode_tokens(prompt, stoi, unk_idx)
+        if not prompt_ids:
+            prompt_ids = [meta["sos_idx"]]
+        idx = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
+        out = model.generate(idx, max_new_tokens=args.max_new_tokens,
+                              temperature=args.temperature, top_k=args.top_k, eos_idx=eos_idx)
+        out_ids = out.squeeze(0).tolist()
+        words = [itos[i] for i in out_ids if i < len(itos) and itos[i] not in ("<pad>", "<sos>")]
+        return " ".join(words)
+
+    if args.text:
+        print(generate_once(args.text))
+        return
+
+    print(f"\nGenerate text (temperature={args.temperature}, top_k={args.top_k}). Type 'quit' to exit.\n")
+    while True:
+        prompt = input("prompt > ").strip()
+        if prompt.lower() in ("quit", "exit"):
+            break
+        print(generate_once(prompt), "\n")
+
+
+# =========================================================================== #
+# MODE: encoder_classify
+# =========================================================================== #
+def build_classify_model(cfg):
+    return TransformerEncoderOnly(
+        vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
+        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"], num_classes=cfg["num_classes"],
+        pooling=cfg.get("pooling", "mean"),
+    ).to(DEVICE)
+
+
+def run_encoder_classify(args):
+    data_dir = args.data_dir or DEFAULT_DATA_DIR["encoder_classify"]
+    ckpt_path = args.ckpt or DEFAULT_CKPT["encoder_classify"]
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+
+    ckpt, cfg = load_checkpoint(ckpt_path, "encoder_classify")
+    model = build_classify_model(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    label_names = cfg.get("label_names") or [str(i) for i in range(cfg["num_classes"])]
+    unk_idx = meta["unk_idx"]
+
+    @torch.no_grad()
+    def classify_once(sentence):
+        _, ids = encode_tokens(sentence, stoi, unk_idx)
+        if not ids:
+            ids = [unk_idx]
+        x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+        logits = model(x, task="classify")
+        probs = torch.softmax(logits, dim=-1).squeeze(0)
+        pred = probs.argmax().item()
+        return label_names[pred], probs[pred].item(), probs
+
+    if args.text:
+        label, conf, _ = classify_once(args.text)
+        print(f"{label}  (confidence {conf:.3f})")
+        return
+
+    print(f"\nClassify text into: {label_names}. Type 'quit' to exit.\n")
+    while True:
+        sentence = input("text > ").strip()
+        if sentence.lower() in ("quit", "exit"):
+            break
+        if not sentence:
+            continue
+        label, conf, probs = classify_once(sentence)
+        print(f"  -> {label}  (confidence {conf:.3f})")
+        print(f"     full distribution: " +
+              ", ".join(f"{n}={p:.3f}" for n, p in zip(label_names, probs.tolist())) + "\n")
+
+
+# =========================================================================== #
+# MODE: encoder_mlm (fill-in-the-blank)
+# =========================================================================== #
+def build_mlm_model(cfg):
+    return TransformerEncoderOnly(
+        vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
+        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+    ).to(DEVICE)
+
+
+def run_encoder_mlm(args):
+    data_dir = args.data_dir or DEFAULT_DATA_DIR["encoder_mlm"]
+    ckpt_path = args.ckpt or DEFAULT_CKPT["encoder_mlm"]
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+
+    ckpt, cfg = load_checkpoint(ckpt_path, "encoder_mlm")
+    model = build_mlm_model(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    unk_idx, mask_idx = meta["unk_idx"], meta["mask_idx"]
+
+    @torch.no_grad()
+    def fill_once(sentence, top_k=5):
+        # clean_text strips underscores/brackets, so swap the blank marker for
+        # a plain word that survives cleaning before tokenizing.
+        placeholder = "xblankx"
+        sentence = (
+            sentence.replace("___", f" {placeholder} ")
+            .replace("<mask>", f" {placeholder} ")
+            .replace("[mask]", f" {placeholder} ")
+        )
+        toks = tokenize(clean_text(sentence))
+        ids, mask_positions = [], []
+        for i, tok in enumerate(toks):
+            if tok == placeholder:
+                ids.append(mask_idx)
+                mask_positions.append(i)
+            else:
+                ids.append(stoi.get(tok, unk_idx))
+
+        if not mask_positions:
+            print("  (no blank found - use ___ where you want a prediction)")
+            return
+
+        x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+        logits = model(x, task="mlm")  # (1, seq_len, vocab)
+
+        for pos in mask_positions:
+            top_vals, top_idx = torch.softmax(logits[0, pos], dim=-1).topk(top_k)
+            preds = [(itos[i], v.item()) for i, v in zip(top_idx.tolist(), top_vals)]
+            print(f"  blank at position {pos}: " +
+                  ", ".join(f"{w} ({p:.3f})" for w, p in preds))
+
+    if args.text:
+        fill_once(args.text, top_k=args.top_k or 5)
+        return
+
+    print("\nFill-in-the-blank. Use ___ where you want a prediction. Type 'quit' to exit.\n")
+    while True:
+        sentence = input("text > ").strip()
+        if sentence.lower() in ("quit", "exit"):
+            break
+        if not sentence:
+            continue
+        fill_once(sentence, top_k=args.top_k or 5)
+        print()
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_arg_parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", required=True,
+                   choices=["encdec", "decoder", "encoder_classify", "encoder_mlm"])
+    p.add_argument("--ckpt", default=None, help="defaults to checkpoints/<mode>/best.pt")
+    p.add_argument("--data-dir", default=None, dest="data_dir",
+                   help="defaults to data/<mode>/")
+    p.add_argument("--text", default=None, help="run once on this input and exit (no REPL)")
+
+    # encdec
+    p.add_argument("--beam", type=int, default=0, help="beam size for encdec, 0 = greedy")
+
+    # decoder
+    p.add_argument("--max-new-tokens", type=int, default=60, dest="max_new_tokens")
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--top-k", type=int, default=20, dest="top_k")
+
+    return p
+
+
+def main():
+    args = build_arg_parser().parse_args()
+
+    if args.mode == "encdec":
+        run_encdec(args)
+    elif args.mode == "decoder":
+        run_decoder(args)
+    elif args.mode == "encoder_classify":
+        run_encoder_classify(args)
+    elif args.mode == "encoder_mlm":
+        run_encoder_mlm(args)
+
+
+if __name__ == "__main__":
+    main()
