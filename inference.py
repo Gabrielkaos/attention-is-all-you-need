@@ -1,7 +1,7 @@
 """
 inference.py
 ------------
-Loads a checkpoint from train.py + the matching vocab(s) from
+Loads a checkpoint from train.py + the matching tokenizer(s) from
 data_cleaning.py, and lets you play with whichever model you trained.
 
     python inference.py --mode encdec                              # translate, REPL
@@ -12,18 +12,26 @@ data_cleaning.py, and lets you play with whichever model you trained.
     python inference.py --mode encoder_mlm                          # fill-in-the-blank, REPL
                                                                       (use ___ as the blank)
 
-Every mode reuses clean_text/tokenize from data_cleaning.py so the
-preprocessing at inference time matches training exactly.
+Every mode reuses clean_text + the BPE/char tokenizer classes from
+data_cleaning.py, so preprocessing at inference time matches training exactly.
+
+Note on encoder_mlm with different tokenizers: a "___" blank always becomes
+exactly one masked token, but what that token *means* depends on --tokenizer
+in data_cleaning.py - with bpe it's usually a whole word or word-piece, with
+char it's a single character. Char-mode fill-in-the-blank is less useful for
+guessing a whole missing word (use several consecutive "___" to mask more
+characters at once).
 """
 
 import os
+import re
 import json
 import argparse
 
 import torch
 
 from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly
-from data_cleaning import clean_text, tokenize
+from data_cleaning import clean_text, load_tokenizer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -44,13 +52,6 @@ DEFAULT_DATA_DIR = {
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
-def load_vocab(path):
-    with open(path, "r", encoding="utf-8") as f:
-        itos = json.load(f)
-    stoi = {tok: i for i, tok in enumerate(itos)}
-    return itos, stoi
-
-
 def load_checkpoint(ckpt_path, expected_mode):
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
     cfg = ckpt["config"]
@@ -59,11 +60,6 @@ def load_checkpoint(ckpt_path, expected_mode):
               f"but you asked for '{expected_mode}' - loading anyway.")
     print(f"Loaded {ckpt_path} (epoch {ckpt['epoch']}, metric={ckpt['metric']:.4f})")
     return ckpt, cfg
-
-
-def encode_tokens(sentence, stoi, unk_idx):
-    toks = tokenize(clean_text(sentence))
-    return toks, [stoi.get(tok, unk_idx) for tok in toks]
 
 
 # =========================================================================== #
@@ -119,40 +115,30 @@ def beam_translate(model, src_ids, sos_idx, eos_idx, beam_size=5, max_len=100, l
     return beams[0][0]
 
 
-def ids_to_words(ids, itos, sos_idx, eos_idx, pad_idx):
-    words = []
-    for i in ids:
-        if i in (sos_idx, pad_idx):
-            continue
-        if i == eos_idx:
-            break
-        words.append(itos[i])
-    return " ".join(words)
-
-
 def run_encdec(args):
     data_dir = args.data_dir or DEFAULT_DATA_DIR["encdec"]
     ckpt_path = args.ckpt or DEFAULT_CKPT["encdec"]
 
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
-    src_itos, src_stoi = load_vocab(os.path.join(data_dir, "src_vocab.json"))
-    tgt_itos, tgt_stoi = load_vocab(os.path.join(data_dir, "tgt_vocab.json"))
+    src_tokenizer = load_tokenizer(os.path.join(data_dir, "src_tokenizer.json"))
+    tgt_tokenizer = load_tokenizer(os.path.join(data_dir, "tgt_tokenizer.json"))
 
     ckpt, cfg = load_checkpoint(ckpt_path, "encdec")
     model = build_encdec_model(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    sos_idx, eos_idx, pad_idx, unk_idx = meta["sos_idx"], meta["eos_idx"], meta["pad_idx"], meta["unk_idx"]
+    sos_idx, eos_idx = meta["sos_idx"], meta["eos_idx"]
 
     def translate_once(sentence):
-        _, src_ids = encode_tokens(sentence, src_stoi, unk_idx)
+        src_ids = src_tokenizer.encode(clean_text(sentence))
+        gen_max_len = cfg["max_len"] - 1  # leave room for the token itself within positional capacity
         if args.beam > 0:
-            out_ids = beam_translate(model, src_ids, sos_idx, eos_idx, beam_size=args.beam)
+            out_ids = beam_translate(model, src_ids, sos_idx, eos_idx, beam_size=args.beam, max_len=gen_max_len)
         else:
-            out_ids = greedy_translate(model, src_ids, sos_idx, eos_idx)
-        return ids_to_words(out_ids, tgt_itos, sos_idx, eos_idx, pad_idx)
+            out_ids = greedy_translate(model, src_ids, sos_idx, eos_idx, max_len=gen_max_len)
+        return tgt_tokenizer.decode(out_ids)
 
     if args.text:
         print(translate_once(args.text))
@@ -186,25 +172,23 @@ def run_decoder(args):
 
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
-    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+    tokenizer = load_tokenizer(os.path.join(data_dir, "tokenizer.json"))
 
     ckpt, cfg = load_checkpoint(ckpt_path, "decoder")
     model = build_decoder_model(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    unk_idx, eos_idx = meta["unk_idx"], meta["eos_idx"]
+    eos_idx = meta["eos_idx"]
 
     def generate_once(prompt):
-        _, prompt_ids = encode_tokens(prompt, stoi, unk_idx)
+        prompt_ids = tokenizer.encode(clean_text(prompt))
         if not prompt_ids:
             prompt_ids = [meta["sos_idx"]]
         idx = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
         out = model.generate(idx, max_new_tokens=args.max_new_tokens,
                               temperature=args.temperature, top_k=args.top_k, eos_idx=eos_idx)
-        out_ids = out.squeeze(0).tolist()
-        words = [itos[i] for i in out_ids if i < len(itos) and itos[i] not in ("<pad>", "<sos>")]
-        return " ".join(words)
+        return tokenizer.decode(out.squeeze(0).tolist())
 
     if args.text:
         print(generate_once(args.text))
@@ -236,7 +220,7 @@ def run_encoder_classify(args):
 
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
-    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+    tokenizer = load_tokenizer(os.path.join(data_dir, "tokenizer.json"))
 
     ckpt, cfg = load_checkpoint(ckpt_path, "encoder_classify")
     model = build_classify_model(cfg)
@@ -248,7 +232,7 @@ def run_encoder_classify(args):
 
     @torch.no_grad()
     def classify_once(sentence):
-        _, ids = encode_tokens(sentence, stoi, unk_idx)
+        ids = tokenizer.encode(clean_text(sentence))
         if not ids:
             ids = [unk_idx]
         x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
@@ -286,58 +270,57 @@ def build_mlm_model(cfg):
     ).to(DEVICE)
 
 
+_BLANK_RE = re.compile(r"___|<mask>|\[mask\]", re.IGNORECASE)
+
+
 def run_encoder_mlm(args):
     data_dir = args.data_dir or DEFAULT_DATA_DIR["encoder_mlm"]
     ckpt_path = args.ckpt or DEFAULT_CKPT["encoder_mlm"]
 
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
-    itos, stoi = load_vocab(os.path.join(data_dir, "vocab.json"))
+    tokenizer = load_tokenizer(os.path.join(data_dir, "tokenizer.json"))
 
     ckpt, cfg = load_checkpoint(ckpt_path, "encoder_mlm")
     model = build_mlm_model(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    unk_idx, mask_idx = meta["unk_idx"], meta["mask_idx"]
+    mask_idx = meta["mask_idx"]
 
     @torch.no_grad()
     def fill_once(sentence, top_k=5):
-        # clean_text strips underscores/brackets, so swap the blank marker for
-        # a plain word that survives cleaning before tokenizing.
-        placeholder = "xblankx"
-        sentence = (
-            sentence.replace("___", f" {placeholder} ")
-            .replace("<mask>", f" {placeholder} ")
-            .replace("[mask]", f" {placeholder} ")
-        )
-        toks = tokenize(clean_text(sentence))
-        ids, mask_positions = [], []
-        for i, tok in enumerate(toks):
-            if tok == placeholder:
-                ids.append(mask_idx)
-                mask_positions.append(i)
-            else:
-                ids.append(stoi.get(tok, unk_idx))
-
-        if not mask_positions:
+        # split on the blank marker(s) so each "___" becomes exactly one
+        # <mask> token id, regardless of how the surrounding text tokenizes
+        parts = _BLANK_RE.split(sentence)
+        if len(parts) == 1:
             print("  (no blank found - use ___ where you want a prediction)")
             return
+
+        ids, mask_positions = [], []
+        for i, part in enumerate(parts):
+            if part:
+                ids.extend(tokenizer.encode(clean_text(part)))
+            if i < len(parts) - 1:
+                mask_positions.append(len(ids))
+                ids.append(mask_idx)
 
         x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
         logits = model(x, task="mlm")  # (1, seq_len, vocab)
 
         for pos in mask_positions:
             top_vals, top_idx = torch.softmax(logits[0, pos], dim=-1).topk(top_k)
-            preds = [(itos[i], v.item()) for i, v in zip(top_idx.tolist(), top_vals)]
+            preds = [(tokenizer.itos[i], v.item()) for i, v in zip(top_idx.tolist(), top_vals)]
             print(f"  blank at position {pos}: " +
-                  ", ".join(f"{w} ({p:.3f})" for w, p in preds))
+                  ", ".join(f"{repr(w)} ({p:.3f})" for w, p in preds))
 
     if args.text:
         fill_once(args.text, top_k=args.top_k or 5)
         return
 
-    print("\nFill-in-the-blank. Use ___ where you want a prediction. Type 'quit' to exit.\n")
+    print("\nFill-in-the-blank. Use ___ where you want a prediction. Type 'quit' to exit.")
+    print("(with --tokenizer char in data_cleaning.py, each ___ predicts a single character,")
+    print(" not a whole word - use several ___ in a row for a longer guess.)\n")
     while True:
         sentence = input("text > ").strip()
         if sentence.lower() in ("quit", "exit"):

@@ -343,6 +343,7 @@ class TransformerDecoderOnly(nn.Module):
     ):
         super().__init__()
         self.pad_idx = pad_idx
+        self.max_len = max_len
         self.stack = GPTStack(vocab_size, d_model, num_layers, num_heads, d_ff, max_len, dropout)
         self.lm_head = nn.Linear(d_model, vocab_size)
         self._init_weights()
@@ -368,9 +369,13 @@ class TransformerDecoderOnly(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
                  top_k: int = None, eos_idx: int = None):
-        """Autoregressive sampling loop, one token at a time."""
+        """Autoregressive sampling loop, one token at a time. Stops early if the
+        sequence would exceed this model's positional-encoding capacity (max_len),
+        even if eos_idx is never predicted."""
         self.eval()
-        for _ in range(max_new_tokens):
+        room = max(0, self.max_len - idx.size(1))
+        steps = min(max_new_tokens, room)
+        for _ in range(steps):
             logits = self.forward(idx)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
 
