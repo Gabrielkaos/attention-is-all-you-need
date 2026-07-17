@@ -454,7 +454,7 @@ def main():
     elif args.mode == "encoder":
         if args.task == "classify":
             if args.dataset is None:
-                args.dataset = "ag_news"
+                args.dataset = "stanfordnlp/imdb"
             prepare_encoder_classify(args)
         else:
             prepare_encoder_mlm(args)
