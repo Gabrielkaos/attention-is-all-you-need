@@ -316,15 +316,44 @@ def save_meta(out_dir, meta: dict):
 def prepare_encdec(args):
     out_dir = os.path.join(args.out_root, "encdec")
 
-    print(f"Loading {args.dataset} ({args.lang_pair}) from Hugging Face ...")
-    raw = load_dataset(args.dataset, args.lang_pair)["train"]
+    if args.src_file and args.tgt_file:
+        print(f"Loading local parallel files: {args.src_file} / {args.tgt_file} ...")
+        with open(args.src_file, "r", encoding="utf-8") as f:
+            src_lines = f.read().splitlines()
+        with open(args.tgt_file, "r", encoding="utf-8") as f:
+            tgt_lines = f.read().splitlines()
+        if len(src_lines) != len(tgt_lines):
+            raise ValueError(
+                f"--src-file has {len(src_lines)} lines but --tgt-file has {len(tgt_lines)} - "
+                "they must be aligned line-by-line (line N of one is the translation of line N of the other)."
+            )
+        src_texts = [clean_text(l) for l in src_lines]
+        tgt_texts = [clean_text(l) for l in tgt_lines]
 
-    print("Cleaning text ...")
-    src_texts, tgt_texts = [], []
-    for example in tqdm(raw):
-        pair = example["translation"]
-        src_texts.append(clean_text(pair[args.src_lang]))
-        tgt_texts.append(clean_text(pair[args.tgt_lang]))
+    elif args.parallel_file:
+        print(f"Loading local TSV: {args.parallel_file} ...")
+        src_texts, tgt_texts = [], []
+        with open(args.parallel_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    continue  # skip malformed rows rather than crashing on one bad line
+                src, tgt = parts
+                src_texts.append(clean_text(src))
+                tgt_texts.append(clean_text(tgt))
+
+    else:
+        print(f"Loading {args.dataset} ({args.lang_pair}) from Hugging Face ...")
+        raw = load_dataset(args.dataset, args.lang_pair)["train"]
+        print("Cleaning text ...")
+        src_texts, tgt_texts = [], []
+        for example in tqdm(raw):
+            pair = example["translation"]
+            src_texts.append(clean_text(pair[args.src_lang]))
+            tgt_texts.append(clean_text(pair[args.tgt_lang]))
 
     print(f"Training {args.tokenizer} tokenizers (src + tgt) ...")
     src_tokenizer = train_tokenizer(src_texts, args.tokenizer, args.vocab_size)
@@ -601,6 +630,15 @@ def build_arg_parser():
     p.add_argument("--lang-pair", default="en-fr", dest="lang_pair")
     p.add_argument("--src-lang", default="en", dest="src_lang")
     p.add_argument("--tgt-lang", default="fr", dest="tgt_lang")
+    p.add_argument("--src-file", default=None, dest="src_file",
+                   help="encdec: local text file, one source sentence per line - "
+                        "use with --tgt-file instead of --dataset")
+    p.add_argument("--tgt-file", default=None, dest="tgt_file",
+                   help="encdec: local text file, one target sentence per line, "
+                        "aligned line-by-line with --src-file")
+    p.add_argument("--parallel-file", default=None, dest="parallel_file",
+                   help="encdec: single local TSV file, each line 'source<TAB>target' - "
+                        "alternative to --src-file/--tgt-file")
 
     # decoder/lines and mlm/stream source override
     p.add_argument("--source", default=None,
@@ -630,7 +668,7 @@ def main():
     elif args.mode == "encoder":
         if args.task == "classify":
             if args.dataset is None:
-                args.dataset = "stanfordnlp/imdb"
+                args.dataset = "ag_news"
             prepare_encoder_classify(args)
         else:
             prepare_encoder_mlm(args)
