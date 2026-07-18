@@ -188,7 +188,7 @@ class Encoder(nn.Module):
         self.layers = nn.ModuleList(
             [EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
         )
-        self.dropout = nn.Dropout(dropout)
+        # self.dropout = nn.Dropout(dropout)
 
     def forward(self, src, src_mask):
         x = self.embedding(src) * math.sqrt(self.d_model)
@@ -211,7 +211,7 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList(
             [DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
         )
-        self.dropout = nn.Dropout(dropout)
+        # self.dropout = nn.Dropout(dropout)
 
     def forward(self, tgt, enc_out, src_mask, tgt_mask):
         x = self.embedding(tgt) * math.sqrt(self.d_model)
@@ -421,6 +421,12 @@ class TransformerEncoderOnly(nn.Module):
         # optional heads - leave num_classes=None to just get contextual embeddings back
         self.classifier = nn.Linear(d_model, num_classes) if num_classes else None
         self.mlm_head = nn.Linear(d_model, vocab_size)  # handy for masked-LM pretraining
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     def make_pad_mask(self, x: torch.Tensor) -> torch.Tensor:
         return (x != self.pad_idx).unsqueeze(1).unsqueeze(2)  # (b,1,1,seq_len)

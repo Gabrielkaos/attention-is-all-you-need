@@ -433,7 +433,7 @@ def prepare_decoder_stream(args):
     print(f"Corpus length: {len(ids)} tokens")
 
     block = args.block_size + 1  # +1 so we can shift by one for (input, target)
-    chunks = [ids[i:i + block] for i in range(0, len(ids) - block, block)]
+    chunks = [ids[i:i + block] for i in range(0, len(ids) - block + 1, block)]
     print(f"Built {len(chunks)} chunks of block_size={args.block_size}")
 
     train, val, test = split_train_val_test(chunks)
@@ -552,7 +552,7 @@ def prepare_encoder_classify(args):
                 continue
             ids = tokenizer.encode(text)
             if 1 <= len(ids) <= args.max_len:
-                data.append((ids, to_id(raw_label)))
+                data.append(([SOS_IDX] + ids, to_id(raw_label)))
         if skipped_unseen:
             print(f"  (skipped {skipped_unseen} examples with labels not seen in the train split)")
         return data
@@ -578,7 +578,7 @@ def prepare_encoder_classify(args):
         "vocab_size": len(tokenizer),
         "num_classes": len(label_names),
         "label_names": label_names,
-        "max_len": args.max_len,
+        "max_len": args.max_len + 1,
     })
     print(f"Done. Saved to ./{out_dir}/")
 
@@ -611,7 +611,7 @@ def prepare_encoder_mlm(args):
         ids.append(EOS_IDX)
 
     block = args.block_size
-    chunks = [ids[i:i + block] for i in range(0, len(ids) - block, block)]
+    chunks = [ids[i:i + block] for i in range(0, len(ids) - block + 1, block)]
     print(f"Built {len(chunks)} chunks of block_size={block}")
 
     train, val, test = split_train_val_test(chunks)

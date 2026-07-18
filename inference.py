@@ -229,12 +229,14 @@ def run_encoder_classify(args):
 
     label_names = cfg.get("label_names") or [str(i) for i in range(cfg["num_classes"])]
     unk_idx = meta["unk_idx"]
+    sos_idx = meta["sos_idx"]
 
     @torch.no_grad()
     def classify_once(sentence):
         ids = tokenizer.encode(clean_text(sentence))
         if not ids:
             ids = [unk_idx]
+        ids = [sos_idx] + ids
         x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
         logits = model(x, task="classify")
         probs = torch.softmax(logits, dim=-1).squeeze(0)
