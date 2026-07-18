@@ -12,10 +12,18 @@ data_cleaning.py. Pick a mode:
 Each mode reads from ./data/<matching_subfolder>/ (created by data_cleaning.py)
 and writes checkpoints to ./checkpoints/<mode_name>/{last,best}.pt.
 
-Shared training recipe (matches the original paper):
+Shared training recipe (matches the original paper) for encdec / decoder / encoder-mlm:
   - Adam (betas=0.9, 0.98, eps=1e-9) + Noam warmup/decay LR schedule
   - label smoothing
   - gradient clipping
+
+encoder --task classify is the exception: it uses a flat AdamW (--lr, --weight-decay)
+instead of Noam. Noam's peak lr scales as d_model**-0.5 * warmup_steps**-0.5, and with a
+small d_model / small dataset / short warmup (as classification typically uses) that peak
+is reached within the first few epochs and is high enough to blow the model up into a
+degenerate "predicts everything as 50/50" state (train_loss stuck at ln(2)). AdamW with a
+small flat lr is the standard recipe for training/fine-tuning small Transformer
+classifiers and avoids that failure mode.
 """
 
 import os
@@ -60,7 +68,7 @@ def save_checkpoint(ckpt_dir, name, model, optimizer, scheduler, config, epoch, 
     torch.save({
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_step": scheduler.step_num,
+        "scheduler_step": scheduler.step_num if scheduler is not None else None,
         "config": config,
         "epoch": epoch,
         "metric": metric,
@@ -375,8 +383,15 @@ def train_encoder_classify(args):
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
+    # NOTE: classification does NOT use the shared Noam schedule. Noam was tuned for
+    # huge-step MT/LM training (paper default: d_model=512, warmup=4000 -> peak lr ~7e-4).
+    # On a small d_model / small dataset / short warmup like this one, Noam's peak lr
+    # (~ d_model**-0.5 * warmup_steps**-0.5) comes out several times higher than that and
+    # is hit within the first few epochs, which is what was blowing the classifier up to
+    # the ln(2) "predicts everything as 50/50" collapse. A flat AdamW lr is the standard
+    # recipe for fine-tuning/training small Transformer classifiers instead.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
 
     config = {
         "mode": "encoder_classify", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
@@ -391,7 +406,6 @@ def train_encoder_classify(args):
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"])
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
-        scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
         best_val_acc = resume_ckpt["metric"]
         print(f"Resumed at epoch {start_epoch} (previous val_acc={best_val_acc:.3f})")
@@ -411,7 +425,6 @@ def train_encoder_classify(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            scheduler.step()
 
             train_loss += loss.item() * tokens.size(0)
             train_correct += (logits.argmax(-1) == labels).sum().item()
@@ -433,7 +446,8 @@ def train_encoder_classify(args):
         val_acc = val_correct / max(val_total, 1)
 
         print(f"[encoder/classify] epoch {epoch:02d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
-              f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | {time.time()-start:.1f}s")
+              f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | lr {optimizer.param_groups[0]['lr']:.6f} "
+              f"| {time.time()-start:.1f}s")
 
         save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_acc)
         if val_acc > best_val_acc:
@@ -610,11 +624,16 @@ def build_arg_parser():
 
     p.add_argument("--batch-size", type=int, default=64, dest="batch_size")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--warmup-steps", type=int, default=4000, dest="warmup_steps")
+    p.add_argument("--warmup-steps", type=int, default=4000, dest="warmup_steps",
+                   help="only used by encdec / decoder / encoder-mlm (Noam schedule)")
     p.add_argument("--label-smoothing", type=float, default=0.1, dest="label_smoothing")
     p.add_argument("--grad-clip", type=float, default=1.0, dest="grad_clip")
     p.add_argument("--pooling", default="mean", choices=["mean", "cls"],
                    help="only used when --mode encoder --task classify")
+    p.add_argument("--lr", type=float, default=3e-4,
+                   help="flat AdamW learning rate, only used when --mode encoder --task classify")
+    p.add_argument("--weight-decay", type=float, default=0.01, dest="weight_decay",
+                   help="AdamW weight decay, only used when --mode encoder --task classify")
 
     return p
 
