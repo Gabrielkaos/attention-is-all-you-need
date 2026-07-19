@@ -293,28 +293,59 @@ def run_encoder_mlm(args):
     @torch.no_grad()
     def fill_once(sentence, top_k=5):
         # split on the blank marker(s) so each "___" becomes exactly one
-        # <mask> token id, regardless of how the surrounding text tokenizes
+        # <mask> token id, regardless of how the surrounding text tokenizes -
+        # this also means one blank can only ever be filled by ONE vocab
+        # entry. If the true word got BPE-split into multiple pieces (e.g.
+        # "birthday" -> "birth" + "day"), a single blank can only produce one
+        # of those pieces, never the whole word - use consecutive blanks
+        # ("___ ___") to give it room for a multi-piece word.
         parts = _BLANK_RE.split(sentence)
         if len(parts) == 1:
             print("  (no blank found - use ___ where you want a prediction)")
             return
 
-        ids, mask_positions = [], []
+        working_ids, mask_positions = [], []
         for i, part in enumerate(parts):
             if part:
-                ids.extend(tokenizer.encode(clean_text(part)))
+                working_ids.extend(tokenizer.encode(clean_text(part)))
             if i < len(parts) - 1:
-                mask_positions.append(len(ids))
-                ids.append(mask_idx)
+                mask_positions.append(len(working_ids))
+                working_ids.append(mask_idx)
 
-        x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
-        logits = model(x, task="mlm")  # (1, seq_len, vocab)
+        # Iteratively resolve the single most-confident blank first, then
+        # substitute its predicted token back into the input before
+        # predicting the rest. A plain one-shot pass predicts every blank
+        # independently, only ever looking at the original masked context -
+        # so for "Happy ___ ___ to you!" it never gets to use its own guess
+        # for one blank while filling the other. Resolving one at a time lets
+        # e.g. "day" (predicted first) inform the "birth"/"day" -> "birthday"
+        # guess for the neighboring blank, once it's substituted back in.
+        remaining = list(mask_positions)
+        resolved = {}
+        while remaining:
+            x = torch.tensor([working_ids], dtype=torch.long, device=DEVICE)
+            probs = torch.softmax(model(x, task="mlm")[0], dim=-1)  # (seq_len, vocab)
+
+            best_pos, best_conf, best_id, best_topk = None, -1.0, None, None
+            for pos in remaining:
+                top_vals, top_idx = probs[pos].topk(top_k)
+                conf = top_vals[0].item()
+                if conf > best_conf:
+                    best_pos, best_conf = pos, conf
+                    best_id = top_idx[0].item()
+                    best_topk = [(tokenizer.itos[i], v)
+                                 for i, v in zip(top_idx.tolist(), top_vals.tolist())]
+
+            working_ids[best_pos] = best_id
+            resolved[best_pos] = best_topk
+            remaining.remove(best_pos)
 
         for pos in mask_positions:
-            top_vals, top_idx = torch.softmax(logits[0, pos], dim=-1).topk(top_k)
-            preds = [(tokenizer.itos[i], v.item()) for i, v in zip(top_idx.tolist(), top_vals)]
+            preds = resolved[pos]
             print(f"  blank at position {pos}: " +
                   ", ".join(f"{repr(w)} ({p:.3f})" for w, p in preds))
+
+        print(f"  filled in: {tokenizer.decode(working_ids)!r}")
 
     if args.text:
         fill_once(args.text, top_k=args.top_k or 5)
