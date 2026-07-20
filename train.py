@@ -631,6 +631,11 @@ def train_encoder_classify(args):
         num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
         max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
         num_classes=meta["num_classes"], pooling=arch["pooling"], rope_theta=arch["rope_theta"],
+        # classify-only training never calls task="mlm", so don't build mlm_head at all -
+        # an unused head's params would never get a gradient under DDP, which is exactly
+        # what DistributedDataParallel's "unused parameters" error/hang is complaining
+        # about (see the comment on TransformerEncoderOnly in model.py).
+        use_mlm_head=False,
     )
     model = prepare_model_for_device(model)
 
@@ -653,6 +658,7 @@ def train_encoder_classify(args):
         "vocab_size": meta["vocab_size"], "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
         "num_classes": meta["num_classes"], "pooling": arch["pooling"],
         "label_names": meta.get("label_names"),
+        "use_mlm_head": False,
     }
 
     start_epoch = 1
