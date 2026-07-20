@@ -24,6 +24,15 @@ is reached within the first few epochs and is high enough to blow the model up i
 degenerate "predicts everything as 50/50" state (train_loss stuck at ln(2)). AdamW with a
 small flat lr is the standard recipe for training/fine-tuning small Transformer
 classifiers and avoids that failure mode.
+
+Multi-GPU: this script uses DistributedDataParallel (DDP), one process per GPU. Launch
+with torchrun instead of plain `python`:
+
+    torchrun --nproc_per_node=<NUM_GPUS> train.py --mode decoder ...
+
+Running it as plain `python train.py ...` still works exactly as before - it just runs
+as a single process on one GPU (or CPU), no DDP involved. See setup_distributed() below
+for how the two modes are told apart.
 """
 
 import os
@@ -36,11 +45,23 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly, default_num_kv_heads
 
+# These five are finalized by setup_distributed() once (called at the top of main()),
+# before any training function runs. DEVICE, in particular, is *not* just "cuda if
+# available" anymore once DDP is in play - each process gets pinned to its own single
+# GPU (cuda:LOCAL_RANK), which is why every place below that used to say
+# "torch.cuda.is_available()" now reads from these globals instead.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RANK = 0
+WORLD_SIZE = 1
+LOCAL_RANK = 0
+IS_DISTRIBUTED = False
 
 
 def resolve_arch_args(args):
@@ -61,38 +82,108 @@ def resolve_arch_args(args):
 
 
 # --------------------------------------------------------------------------- #
-# Multi-GPU helpers (nn.DataParallel)
+# Distributed (DDP) helpers
 # --------------------------------------------------------------------------- #
-def prepare_model_for_device(model):
-    """Moves model to DEVICE and, if more than one CUDA GPU is visible, wraps it in
-    nn.DataParallel so a single process fans batches out across all of them. On CPU
-    or a single-GPU machine this just moves the model over and returns it unwrapped.
-    Checkpoints always store the *unwrapped* state dict (see save_checkpoint /
-    load_model_state), so switching between 1-GPU and multi-GPU machines across runs
-    is transparent."""
-    model = model.to(DEVICE)
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if n_gpus > 1:
-        print(f"Found {n_gpus} GPUs -> wrapping model in nn.DataParallel")
-        model = nn.DataParallel(model)
-    elif n_gpus == 1:
-        print("Found 1 GPU -> training on a single GPU (no DataParallel)")
+def setup_distributed():
+    """Detects whether we were launched via torchrun (it sets RANK/WORLD_SIZE/
+    LOCAL_RANK env vars) and, if so, initializes the process group and points this
+    process's DEVICE at its own single GPU. If those env vars aren't present - i.e.
+    someone just ran `python train.py ...` - this is a no-op and everything behaves
+    exactly like a single-process run always has.
+
+    Must be called once at the very top of main(), before any model/optimizer/
+    dataloader is built, since prepare_model_for_device / make_dataloader /
+    reduce_sum all read the globals this function sets."""
+    global DEVICE, RANK, WORLD_SIZE, LOCAL_RANK, IS_DISTRIBUTED
+
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    IS_DISTRIBUTED = WORLD_SIZE > 1
+
+    if not IS_DISTRIBUTED:
+        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return
+
+    RANK = int(os.environ["RANK"])
+    LOCAL_RANK = int(os.environ["LOCAL_RANK"])
+    # NCCL needs real GPUs; fall back to gloo so `torchrun --nproc_per_node=N` still
+    # works (slowly, over CPU) on a machine with no CUDA, e.g. for a local smoke test.
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(LOCAL_RANK)
+        DEVICE = torch.device("cuda", LOCAL_RANK)
     else:
-        print("No GPU found -> training on CPU")
-    return model
+        DEVICE = torch.device("cpu")
+
+    if RANK == 0:
+        print(f"Distributed training: world_size={WORLD_SIZE}, backend={backend}")
+
+
+def cleanup_distributed():
+    """Tears down the process group. No-op outside DDP."""
+    if IS_DISTRIBUTED:
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """True on rank 0, or always True outside DDP. Use this to gate prints and
+    checkpoint saves so N processes don't race on the same stdout / file."""
+    return RANK == 0
+
+
+def reduce_sum(tensor):
+    """All-reduces (SUM) a scalar tensor across every DDP process in place. Every
+    train/val loop below accumulates loss/token/correct counts as running sums on
+    DEVICE specifically so this can fold in the other ranks' shards with one
+    collective call right before the final division - the same trick that already
+    avoided a per-batch .item() sync now also gives a *global* metric instead of
+    just this process's local shard. No-op (returns tensor unchanged) outside DDP."""
+    if IS_DISTRIBUTED:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor
 
 
 def raw_model(model):
-    """Returns the underlying module whether or not `model` is DataParallel-wrapped.
-    Use this whenever you need to reach model-specific attributes/methods that
-    DataParallel doesn't proxy."""
-    return model.module if isinstance(model, nn.DataParallel) else model
+    """Returns the underlying module whether or not `model` is DDP-wrapped. Use this
+    whenever you need to reach model-specific attributes/methods that DDP doesn't
+    proxy, and whenever saving a checkpoint (checkpoints always store the unwrapped
+    state dict - see save_checkpoint)."""
+    return model.module if isinstance(model, DDP) else model
 
 
 def load_model_state(model, state_dict):
     """Loads a checkpoint's (always-unwrapped) state dict into `model`, whether or
-    not `model` is currently DataParallel-wrapped."""
+    not `model` is currently DDP-wrapped."""
     raw_model(model).load_state_dict(state_dict)
+
+
+def prepare_model_for_device(model):
+    """Moves model to this process's DEVICE. Under torchrun (world_size > 1, see
+    setup_distributed), wraps it in DistributedDataParallel bound to this process's
+    single GPU: each process owns exactly one GPU and one copy of the model, and DDP
+    keeps their gradients in sync with an automatic all-reduce during backward()
+    (unlike the old single-process gather/scatter nn.DataParallel used to do, which
+    couldn't scale past one machine and was slower even on one machine with several
+    GPUs). Outside torchrun this just moves the model to DEVICE and returns it
+    unwrapped - identical to a plain single-GPU or CPU run. Checkpoints always store
+    the *unwrapped* state dict (see save_checkpoint / load_model_state), so a
+    checkpoint produced by an 8-process DDP run loads back fine into a single-process
+    run and vice versa."""
+    model = model.to(DEVICE)
+    if IS_DISTRIBUTED:
+        device_ids = [LOCAL_RANK] if DEVICE.type == "cuda" else None
+        output_device = device_ids[0] if device_ids else None
+        model = DDP(model, device_ids=device_ids, output_device=output_device)
+        if is_main_process():
+            print(f"Distributed: wrapped model in DDP across {WORLD_SIZE} processes "
+                  f"(backend={dist.get_backend()})")
+    elif DEVICE.type == "cuda":
+        print(f"Found 1 GPU -> training on {DEVICE} (single process, no DDP). "
+              f"Use `torchrun --nproc_per_node=N train.py ...` for multi-GPU.")
+    else:
+        print("No GPU found -> training on CPU")
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +208,33 @@ def dataloader_kwargs(args):
         pin_memory=torch.cuda.is_available(),
         persistent_workers=args.num_workers > 0,
     )
+
+
+def make_dataloader(dataset, batch_size, shuffle, collate_fn, args):
+    """Builds a DataLoader that works identically in single-process and torchrun/DDP
+    runs. Under DDP each rank gets a DistributedSampler slice of the dataset - so N
+    processes each train on 1/N of the data per epoch instead of all N redundantly
+    training on the whole thing - and the sampler itself does the shuffling, so
+    `shuffle` only gets passed straight to the DataLoader when there's no sampler
+    (DataLoader raises if you pass both `shuffle=True` and a `sampler`). Returns
+    (loader, sampler); sampler is None outside DDP. When it isn't None, call
+    sampler.set_epoch(epoch) once before iterating each training epoch (see the
+    training loops below) - without that call every rank would reshuffle to the
+    exact same order every epoch instead of a fresh one.
+
+    Note for validation: DistributedSampler pads the tail so every rank gets an
+    equal number of batches, which can very slightly double-count a handful of
+    samples when the dataset size isn't evenly divisible by world_size. Negligible
+    for picking a best checkpoint, but worth knowing about."""
+    sampler = None
+    if IS_DISTRIBUTED:
+        sampler = DistributedSampler(dataset, num_replicas=WORLD_SIZE, rank=RANK, shuffle=shuffle)
+    loader = DataLoader(
+        dataset, batch_size=batch_size,
+        shuffle=(shuffle if sampler is None else False),
+        sampler=sampler, collate_fn=collate_fn, **dataloader_kwargs(args),
+    )
+    return loader, sampler
 
 
 def autocast_ctx(args):
@@ -229,9 +347,8 @@ def train_encdec(args):
     val_ds = EncDecDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_encdec(b, pad_idx)
-    loader_kwargs = dataloader_kwargs(args)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
+    train_loader, train_sampler = make_dataloader(train_ds, args.batch_size, True, collate, args)
+    val_loader, _ = make_dataloader(val_ds, args.batch_size, False, collate, args)
 
     resume_ckpt = load_resume(args.resume)
     # if resuming, architecture must match the saved checkpoint - CLI arch flags are ignored
@@ -267,10 +384,13 @@ def train_encdec(args):
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
         best_val = resume_ckpt["metric"]
-        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+        if is_main_process():
+            print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
 
     for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)  # re-shuffles each rank's shard differently per epoch
 
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
@@ -292,6 +412,8 @@ def train_encdec(args):
             n_tok = (tgt_out != pad_idx).sum()
             train_loss_sum += loss.detach() * n_tok
             train_tokens_sum += n_tok
+        reduce_sum(train_loss_sum)
+        reduce_sum(train_tokens_sum)
         train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
 
         model.eval()
@@ -308,17 +430,22 @@ def train_encdec(args):
                 n_tok = (tgt_out != pad_idx).sum()
                 val_loss_sum += loss.detach() * n_tok
                 val_tokens_sum += n_tok
+        reduce_sum(val_loss_sum)
+        reduce_sum(val_tokens_sum)
         val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
 
-        print(f"[encdec] epoch {epoch:02d} | train_loss {train_loss:.4f} "
-              f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
-              f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
+        if is_main_process():
+            print(f"[encdec] epoch {epoch:02d} | train_loss {train_loss:.4f} "
+                  f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
+                  f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
-        if val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
-            print(f"  -> new best (val_loss={val_loss:.4f})")
+            save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
+            if val_loss < best_val:
+                best_val = val_loss
+                save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
+                print(f"  -> new best (val_loss={val_loss:.4f})")
+        if IS_DISTRIBUTED:
+            dist.barrier()  # keep ranks together while rank 0 writes the checkpoint files
 
 
 # =========================================================================== #
@@ -358,9 +485,8 @@ def train_decoder(args):
     val_ds = LMDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_lm(b, pad_idx)
-    loader_kwargs = dataloader_kwargs(args)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
+    train_loader, train_sampler = make_dataloader(train_ds, args.batch_size, True, collate, args)
+    val_loader, _ = make_dataloader(val_ds, args.batch_size, False, collate, args)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
@@ -392,10 +518,13 @@ def train_decoder(args):
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
         best_val = resume_ckpt["metric"]
-        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+        if is_main_process():
+            print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
 
     for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
@@ -414,6 +543,8 @@ def train_decoder(args):
             n_tok = (y != pad_idx).sum()
             train_loss_sum += loss.detach() * n_tok
             train_tokens_sum += n_tok
+        reduce_sum(train_loss_sum)
+        reduce_sum(train_tokens_sum)
         train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
 
         model.eval()
@@ -429,17 +560,22 @@ def train_decoder(args):
                 n_tok = (y != pad_idx).sum()
                 val_loss_sum += loss.detach() * n_tok
                 val_tokens_sum += n_tok
+        reduce_sum(val_loss_sum)
+        reduce_sum(val_tokens_sum)
         val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
 
-        print(f"[decoder] epoch {epoch:02d} | train_loss {train_loss:.4f} "
-              f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
-              f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
+        if is_main_process():
+            print(f"[decoder] epoch {epoch:02d} | train_loss {train_loss:.4f} "
+                  f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
+                  f"(ppl {math.exp(min(val_loss, 20)):.2f}) | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
-        if val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
-            print(f"  -> new best (val_loss={val_loss:.4f})")
+            save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
+            if val_loss < best_val:
+                best_val = val_loss
+                save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
+                print(f"  -> new best (val_loss={val_loss:.4f})")
+        if IS_DISTRIBUTED:
+            dist.barrier()
 
 
 # =========================================================================== #
@@ -479,9 +615,8 @@ def train_encoder_classify(args):
     val_ds = ClassifyDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_classify(b, pad_idx)
-    loader_kwargs = dataloader_kwargs(args)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
+    train_loader, train_sampler = make_dataloader(train_ds, args.batch_size, True, collate, args)
+    val_loader, _ = make_dataloader(val_ds, args.batch_size, False, collate, args)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else {**resolve_arch_args(args), "pooling": args.pooling}
@@ -522,15 +657,18 @@ def train_encoder_classify(args):
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
         start_epoch = resume_ckpt["epoch"] + 1
         best_val_acc = resume_ckpt["metric"]
-        print(f"Resumed at epoch {start_epoch} (previous val_acc={best_val_acc:.3f})")
+        if is_main_process():
+            print(f"Resumed at epoch {start_epoch} (previous val_acc={best_val_acc:.3f})")
 
     for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_correct_sum = torch.zeros((), device=DEVICE)
-        train_total = 0
+        train_total_sum = torch.zeros((), device=DEVICE)
         for tokens, labels in train_loader:
             tokens = tokens.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
@@ -544,14 +682,17 @@ def train_encoder_classify(args):
             bs = tokens.size(0)  # plain python int, shape metadata only - no sync
             train_loss_sum += loss.detach() * bs
             train_correct_sum += (logits.argmax(-1) == labels).sum()
-            train_total += bs
-        train_loss = (train_loss_sum / max(train_total, 1)).item()
-        train_acc = (train_correct_sum / max(train_total, 1)).item()
+            train_total_sum += bs
+        reduce_sum(train_loss_sum)
+        reduce_sum(train_correct_sum)
+        reduce_sum(train_total_sum)
+        train_loss = (train_loss_sum / train_total_sum.clamp(min=1)).item()
+        train_acc = (train_correct_sum / train_total_sum.clamp(min=1)).item()
 
         model.eval()
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_correct_sum = torch.zeros((), device=DEVICE)
-        val_total = 0
+        val_total_sum = torch.zeros((), device=DEVICE)
         with torch.no_grad():
             for tokens, labels in val_loader:
                 tokens = tokens.to(DEVICE, non_blocking=True)
@@ -562,19 +703,25 @@ def train_encoder_classify(args):
                 bs = tokens.size(0)
                 val_loss_sum += loss.detach() * bs
                 val_correct_sum += (logits.argmax(-1) == labels).sum()
-                val_total += bs
-        val_loss = (val_loss_sum / max(val_total, 1)).item()
-        val_acc = (val_correct_sum / max(val_total, 1)).item()
+                val_total_sum += bs
+        reduce_sum(val_loss_sum)
+        reduce_sum(val_correct_sum)
+        reduce_sum(val_total_sum)
+        val_loss = (val_loss_sum / val_total_sum.clamp(min=1)).item()
+        val_acc = (val_correct_sum / val_total_sum.clamp(min=1)).item()
 
-        print(f"[encoder/classify] epoch {epoch:02d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
-              f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | lr {optimizer.param_groups[0]['lr']:.6f} "
-              f"| {time.time()-start:.1f}s")
+        if is_main_process():
+            print(f"[encoder/classify] epoch {epoch:02d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
+                  f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | lr {optimizer.param_groups[0]['lr']:.6f} "
+                  f"| {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_acc)
-            print(f"  -> new best (val_acc={val_acc:.3f})")
+            save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_acc)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_acc)
+                print(f"  -> new best (val_acc={val_acc:.3f})")
+        if IS_DISTRIBUTED:
+            dist.barrier()
 
 
 # =========================================================================== #
@@ -640,9 +787,8 @@ def train_encoder_mlm(args):
     val_ds = MLMDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_mlm(b, pad_idx)
-    loader_kwargs = dataloader_kwargs(args)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
+    train_loader, train_sampler = make_dataloader(train_ds, args.batch_size, True, collate, args)
+    val_loader, _ = make_dataloader(val_ds, args.batch_size, False, collate, args)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
@@ -674,10 +820,13 @@ def train_encoder_mlm(args):
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
         best_val = resume_ckpt["metric"]
-        print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
+        if is_main_process():
+            print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val:.4f})")
 
     for epoch in range(start_epoch, args.epochs + 1):
         start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
@@ -696,6 +845,8 @@ def train_encoder_mlm(args):
             n_masked = (labels != -100).sum()
             train_loss_sum += loss.detach() * n_masked
             train_masked_sum += n_masked
+        reduce_sum(train_loss_sum)
+        reduce_sum(train_masked_sum)
         train_loss = (train_loss_sum / train_masked_sum.clamp(min=1)).item()
 
         model.eval()
@@ -711,16 +862,21 @@ def train_encoder_mlm(args):
                 n_masked = (labels != -100).sum()
                 val_loss_sum += loss.detach() * n_masked
                 val_masked_sum += n_masked
+        reduce_sum(val_loss_sum)
+        reduce_sum(val_masked_sum)
         val_loss = (val_loss_sum / val_masked_sum.clamp(min=1)).item()
 
-        print(f"[encoder/mlm] epoch {epoch:02d} | train_loss {train_loss:.4f} "
-              f"| val_loss {val_loss:.4f} | {time.time()-start:.1f}s")
+        if is_main_process():
+            print(f"[encoder/mlm] epoch {epoch:02d} | train_loss {train_loss:.4f} "
+                  f"| val_loss {val_loss:.4f} | {time.time()-start:.1f}s")
 
-        save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
-        if val_loss < best_val:
-            best_val = val_loss
-            save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
-            print(f"  -> new best (val_loss={val_loss:.4f})")
+            save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
+            if val_loss < best_val:
+                best_val = val_loss
+                save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
+                print(f"  -> new best (val_loss={val_loss:.4f})")
+        if IS_DISTRIBUTED:
+            dist.barrier()
 
 
 # --------------------------------------------------------------------------- #
@@ -751,7 +907,10 @@ def build_arg_parser():
     p.add_argument("--rope-theta", type=float, default=10000.0, dest="rope_theta",
                    help="base frequency for the Rotary Position Embedding table")
 
-    p.add_argument("--batch-size", type=int, default=64, dest="batch_size")
+    p.add_argument("--batch-size", type=int, default=64, dest="batch_size",
+                   help="per-process batch size. Under torchrun with N processes, the "
+                        "effective global batch size is batch_size * N, since each process "
+                        "pulls its own batch from its own DistributedSampler shard.")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--num-workers", type=int, default=4, dest="num_workers",
                    help="DataLoader background worker processes. With 0, batch "
@@ -780,15 +939,18 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
-
-    if args.mode == "encdec":
-        train_encdec(args)
-    elif args.mode == "decoder":
-        train_decoder(args)
-    elif args.mode == "encoder" and args.task == "classify":
-        train_encoder_classify(args)
-    elif args.mode == "encoder" and args.task == "mlm":
-        train_encoder_mlm(args)
+    setup_distributed()
+    try:
+        if args.mode == "encdec":
+            train_encdec(args)
+        elif args.mode == "decoder":
+            train_decoder(args)
+        elif args.mode == "encoder" and args.task == "classify":
+            train_encoder_classify(args)
+        elif args.mode == "encoder" and args.task == "mlm":
+            train_encoder_mlm(args)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
