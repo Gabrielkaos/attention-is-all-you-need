@@ -8,6 +8,7 @@ data_cleaning.py. Pick a mode:
     python train.py --mode decoder                   # TransformerDecoderOnly (GPT-style)
     python train.py --mode encoder --task classify    # TransformerEncoderOnly (classification)
     python train.py --mode encoder --task mlm         # TransformerEncoderOnly (masked-LM pretrain)
+    python train.py --mode encoder --task regression  # TransformerRegression (predict a float from text)
 
 Each mode reads from ./data/<matching_subfolder>/ (created by data_cleaning.py)
 and writes checkpoints to ./checkpoints/<mode_name>/{last,best}.pt.
@@ -17,13 +18,14 @@ Shared training recipe (matches the original paper) for encdec / decoder / encod
   - label smoothing
   - gradient clipping
 
-encoder --task classify is the exception: it uses a flat AdamW (--lr, --weight-decay)
-instead of Noam. Noam's peak lr scales as d_model**-0.5 * warmup_steps**-0.5, and with a
-small d_model / small dataset / short warmup (as classification typically uses) that peak
-is reached within the first few epochs and is high enough to blow the model up into a
-degenerate "predicts everything as 50/50" state (train_loss stuck at ln(2)). AdamW with a
-small flat lr is the standard recipe for training/fine-tuning small Transformer
-classifiers and avoids that failure mode.
+encoder --task classify and encoder --task regression are the exception: they use a flat
+AdamW (--lr, --weight-decay) instead of Noam. Noam's peak lr scales as d_model**-0.5 *
+warmup_steps**-0.5, and with a small d_model / small dataset / short warmup (as
+classification/regression typically use) that peak is reached within the first few epochs
+and is high enough to blow the model up into a degenerate state (classification: "predicts
+everything as 50/50", train_loss stuck at ln(2); regression: predicts the target mean for
+everything, no matter the input). AdamW with a small flat lr is the standard recipe for
+training/fine-tuning small Transformer classifiers/regressors and avoids that failure mode.
 
 Multi-GPU: this script uses DistributedDataParallel (DDP), one process per GPU. Launch
 with torchrun instead of plain `python`:
@@ -50,7 +52,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly, default_num_kv_heads
+from model import (
+    Transformer, TransformerDecoderOnly, TransformerEncoderOnly, TransformerRegression,
+    default_num_kv_heads,
+)
 
 # These five are finalized by setup_distributed() once (called at the top of main()),
 # before any training function runs. DEVICE, in particular, is *not* just "cuda if
@@ -725,6 +730,152 @@ def train_encoder_classify(args):
 
 
 # =========================================================================== #
+# MODE 3c: encoder-only, regression
+# =========================================================================== #
+class RegressionDataset(Dataset):
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            self.data = pickle.load(f)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        tokens, target = self.data[idx]
+        return torch.tensor(tokens, dtype=torch.long), target
+
+
+def collate_regression(batch, pad_idx):
+    tokens, targets = zip(*batch)
+    max_len = max(len(t) for t in tokens)
+    padded = torch.full((len(batch), max_len), pad_idx, dtype=torch.long)
+    for i, t in enumerate(tokens):
+        padded[i, :len(t)] = t
+    return padded, torch.tensor(targets, dtype=torch.float32)
+
+
+def train_encoder_regression(args):
+    data_dir = os.path.join(args.data_root, "encoder_regression")
+    ckpt_dir = os.path.join(args.ckpt_root, "encoder_regression")
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    pad_idx = meta["pad_idx"]
+    num_targets = meta.get("num_targets", 1)
+
+    train_ds = RegressionDataset(os.path.join(data_dir, "train.pkl"))
+    val_ds = RegressionDataset(os.path.join(data_dir, "val.pkl"))
+
+    collate = lambda b: collate_regression(b, pad_idx)
+    train_loader, train_sampler = make_dataloader(train_ds, args.batch_size, True, collate, args)
+    val_loader, _ = make_dataloader(val_ds, args.batch_size, False, collate, args)
+
+    resume_ckpt = load_resume(args.resume)
+    arch = resume_ckpt["config"] if resume_ckpt else {**resolve_arch_args(args), "pooling": args.pooling}
+
+    model = TransformerRegression(
+        vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
+        num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
+        max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
+        num_targets=num_targets, pooling=arch["pooling"], rope_theta=arch["rope_theta"],
+    )
+    model = prepare_model_for_device(model)
+
+    criterion = nn.MSELoss()
+    # Same reasoning as encoder --task classify: a small d_model / small dataset / short
+    # warmup makes Noam's peak lr high enough to blow this small head up (here: collapsing
+    # to always predicting the target mean). Flat AdamW is the standard, stable choice.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    scaler = make_grad_scaler(args)
+
+    config = {
+        "mode": "encoder_regression", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
+        "num_heads": arch["num_heads"], "num_kv_heads": arch["num_kv_heads"], "d_ff": arch["d_ff"],
+        "dropout": arch["dropout"], "rope_theta": arch["rope_theta"],
+        "vocab_size": meta["vocab_size"], "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
+        "num_targets": num_targets, "pooling": arch["pooling"],
+        # needed by inference.py to map standardized predictions back to the original scale
+        "target_mean": meta.get("target_mean", 0.0), "target_std": meta.get("target_std", 1.0),
+    }
+
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if resume_ckpt is not None:
+        load_model_state(model, resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        start_epoch = resume_ckpt["epoch"] + 1
+        best_val_loss = resume_ckpt["metric"]
+        if is_main_process():
+            print(f"Resumed at epoch {start_epoch} (previous val_loss={best_val_loss:.4f})")
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        model.train()
+        train_loss_sum = torch.zeros((), device=DEVICE)
+        train_abs_err_sum = torch.zeros((), device=DEVICE)
+        train_total_sum = torch.zeros((), device=DEVICE)
+        for tokens, targets in train_loader:
+            tokens = tokens.to(DEVICE, non_blocking=True)
+            targets = targets.to(DEVICE, non_blocking=True)
+
+            with autocast_ctx(args):
+                preds = model(tokens, task="regress").squeeze(-1)  # (batch,) - assumes num_targets == 1
+                loss = criterion(preds, targets)
+
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+
+            bs = tokens.size(0)
+            train_loss_sum += loss.detach() * bs
+            train_abs_err_sum += (preds.detach() - targets).abs().sum()
+            train_total_sum += bs
+        reduce_sum(train_loss_sum)
+        reduce_sum(train_abs_err_sum)
+        reduce_sum(train_total_sum)
+        train_loss = (train_loss_sum / train_total_sum.clamp(min=1)).item()
+        train_mae = (train_abs_err_sum / train_total_sum.clamp(min=1)).item()
+
+        model.eval()
+        val_loss_sum = torch.zeros((), device=DEVICE)
+        val_abs_err_sum = torch.zeros((), device=DEVICE)
+        val_total_sum = torch.zeros((), device=DEVICE)
+        with torch.no_grad():
+            for tokens, targets in val_loader:
+                tokens = tokens.to(DEVICE, non_blocking=True)
+                targets = targets.to(DEVICE, non_blocking=True)
+                with autocast_ctx(args):
+                    preds = model(tokens, task="regress").squeeze(-1)
+                    loss = criterion(preds, targets)
+                bs = tokens.size(0)
+                val_loss_sum += loss.detach() * bs
+                val_abs_err_sum += (preds.detach() - targets).abs().sum()
+                val_total_sum += bs
+        reduce_sum(val_loss_sum)
+        reduce_sum(val_abs_err_sum)
+        reduce_sum(val_total_sum)
+        val_loss = (val_loss_sum / val_total_sum.clamp(min=1)).item()
+        val_mae = (val_abs_err_sum / val_total_sum.clamp(min=1)).item()
+
+        # MAE reported in standardized units (same scale the model was trained on) -
+        # multiply by meta["target_std"] to convert back to the original label units.
+        if is_main_process():
+            print(f"[encoder/regression] epoch {epoch:02d} | train_loss(MSE) {train_loss:.4f} "
+                  f"mae {train_mae:.4f} | val_loss(MSE) {val_loss:.4f} mae {val_mae:.4f} "
+                  f"| lr {optimizer.param_groups[0]['lr']:.6f} | {time.time()-start:.1f}s")
+
+            save_checkpoint(ckpt_dir, "last.pt", model, optimizer, scheduler, config, epoch, val_loss)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(ckpt_dir, "best.pt", model, optimizer, scheduler, config, epoch, val_loss)
+                print(f"  -> new best (val_loss={val_loss:.4f})")
+        if IS_DISTRIBUTED:
+            dist.barrier()
+
+
+# =========================================================================== #
 # MODE 3b: encoder-only, mlm
 # =========================================================================== #
 class MLMDataset(Dataset):
@@ -886,7 +1037,7 @@ def train_encoder_mlm(args):
 def build_arg_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True, choices=["encdec", "decoder", "encoder"])
-    p.add_argument("--task", default="classify", choices=["classify", "mlm"],
+    p.add_argument("--task", default="classify", choices=["classify", "mlm", "regression"],
                    help="only used when --mode encoder")
 
     p.add_argument("--data-root", default="data", dest="data_root")
@@ -929,11 +1080,11 @@ def build_arg_parser():
     p.add_argument("--label-smoothing", type=float, default=0.1, dest="label_smoothing")
     p.add_argument("--grad-clip", type=float, default=1.0, dest="grad_clip")
     p.add_argument("--pooling", default="mean", choices=["mean", "cls"],
-                   help="only used when --mode encoder --task classify")
+                   help="only used when --mode encoder --task classify/regression")
     p.add_argument("--lr", type=float, default=3e-4,
-                   help="flat AdamW learning rate, only used when --mode encoder --task classify")
+                   help="flat AdamW learning rate, only used when --mode encoder --task classify/regression")
     p.add_argument("--weight-decay", type=float, default=0.01, dest="weight_decay",
-                   help="AdamW weight decay, only used when --mode encoder --task classify")
+                   help="AdamW weight decay, only used when --mode encoder --task classify/regression")
 
     return p
 
@@ -950,6 +1101,8 @@ def main():
             train_encoder_classify(args)
         elif args.mode == "encoder" and args.task == "mlm":
             train_encoder_mlm(args)
+        elif args.mode == "encoder" and args.task == "regression":
+            train_encoder_regression(args)
     finally:
         cleanup_distributed()
 

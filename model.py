@@ -686,6 +686,74 @@ class TransformerEncoderOnly(nn.Module):
         return self.classifier(pooled)  # (batch, num_classes)
 
 
+# --------------------------------------------------------------------------- #
+# Encoder-only stack for regression (BERT-style, same backbone/pooling as
+# TransformerEncoderOnly above): embedding -> N x (Pre-LN self-attn + Pre-LN
+# SwiGLU FFN) -> final RMSNorm -> pool -> Linear(d_model, num_targets), no
+# activation on the output (raw real-valued predictions, not logits). Kept as
+# its own class rather than a third "task" on TransformerEncoderOnly since a
+# regression head has no vocab-shaped classifier/mlm_head to carry around and
+# its loss (MSE, on floats) is a different shape of problem than
+# cross-entropy over discrete classes/tokens.
+# --------------------------------------------------------------------------- #
+class TransformerRegression(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        d_ff: int = 1024,
+        num_kv_heads: int = None,
+        max_len: int = 512,
+        dropout: float = 0.1,
+        pad_idx: int = 0,
+        num_targets: int = 1,
+        pooling: str = "mean",  # "mean" or "cls" (assumes token 0 of each sequence is a [CLS]-like token)
+        rope_theta: float = 10000.0,
+    ):
+        super().__init__()
+        self.pad_idx = pad_idx
+        self.pooling = pooling
+        self.num_targets = num_targets
+        num_kv_heads = num_kv_heads or default_num_kv_heads(num_heads)
+        self.encoder = Encoder(vocab_size, d_model, num_layers, num_heads, d_ff,
+                                num_kv_heads, max_len, dropout, rope_theta)
+
+        # Plain linear head, no activation - regression targets are unbounded
+        # (or standardized to mean 0 / std 1 upstream in data_cleaning.py), so
+        # there's nothing to squash the way softmax squashes classification
+        # logits into a distribution.
+        self.regressor = nn.Linear(d_model, num_targets)
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def make_pad_mask(self, x: torch.Tensor) -> torch.Tensor:
+        return (x != self.pad_idx).unsqueeze(1).unsqueeze(2)  # (b,1,1,seq_len)
+
+    def forward(self, x: torch.Tensor, task: str = "regress"):
+        mask = self.make_pad_mask(x)
+        hidden = self.encoder(x, mask)  # (batch, seq_len, d_model)
+
+        if task == "embed":
+            return hidden
+
+        # task == "regress"
+        if self.pooling == "cls":
+            pooled = hidden[:, 0, :]
+        else:  # mean-pool over real (non-pad) tokens
+            pad_mask_2d = (x != self.pad_idx).unsqueeze(-1).float()  # (b, seq_len, 1)
+            summed = (hidden * pad_mask_2d).sum(dim=1)
+            counts = pad_mask_2d.sum(dim=1).clamp(min=1e-6)
+            pooled = summed / counts
+
+        return self.regressor(pooled)  # (batch, num_targets)
+
+
 if __name__ == "__main__":
     # quick sanity check - encoder-decoder (translation-style), GQA (4 heads, 2 kv heads)
     model = Transformer(src_vocab_size=1000, tgt_vocab_size=1000,
@@ -723,3 +791,9 @@ if __name__ == "__main__":
                                    num_heads=4, num_kv_heads=2, d_ff=512, num_classes=3)
     cls_logits = bert(x, task="classify")
     print("TransformerEncoderOnly (BERT-style) classification logits shape:", cls_logits.shape)  # (2, 3)
+
+    # encoder-only regression (e.g. predicting a star rating / similarity score from text)
+    regressor = TransformerRegression(vocab_size=1000, d_model=128, num_layers=2,
+                                       num_heads=4, num_kv_heads=2, d_ff=512, num_targets=1)
+    preds = regressor(x, task="regress")
+    print("TransformerRegression predictions shape:", preds.shape)  # (2, 1)

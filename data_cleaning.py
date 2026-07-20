@@ -25,6 +25,15 @@ Three modes, matching train.py's three modes:
       TransformerEncoderOnly (same chunking as decoder/stream - masking
       itself happens dynamically in train.py, not here).
 
+  --mode encoder --task regression
+      Text paired with a numeric (float) target for TransformerRegression -
+      e.g. predicting a star rating from review text.
+      Default source: HF `yelp_review_full` (text -> 0-4 star rating, used
+      here as a numeric regression target rather than a class label).
+      Targets are standardized (zero mean, unit std, computed on the train
+      split only) before saving; the mean/std are stored in meta.json so
+      train.py/inference.py can convert predictions back to the original scale.
+
 Tokenization: --tokenizer {bpe,char}, default bpe.
   bpe  : a from-scratch Byte-Pair-Encoding tokenizer (Sennrich et al. style) -
          learns subword merges from your training corpus. --vocab-size controls
@@ -49,6 +58,7 @@ Examples:
     python data_cleaning.py --mode decoder --unit lines --source names.txt
     python data_cleaning.py --mode encoder --task classify
     python data_cleaning.py --mode encoder --task mlm
+    python data_cleaning.py --mode encoder --task regression
 """
 
 import os
@@ -584,6 +594,85 @@ def prepare_encoder_classify(args):
 
 
 # --------------------------------------------------------------------------- #
+# Mode 3c: encoder-only, regression
+# --------------------------------------------------------------------------- #
+def prepare_encoder_regression(args):
+    out_dir = os.path.join(args.out_root, "encoder_regression")
+
+    print(f"Loading {args.dataset} from Hugging Face ...")
+    raw = load_dataset(args.dataset)
+    train_raw = raw["train"]
+    test_raw = raw["test"] if "test" in raw else None
+
+    text_field = args.text_field
+    label_field = args.label_field
+
+    def clean_split(split):
+        texts, targets = [], []
+        for ex in tqdm(split):
+            texts.append(clean_text(ex[text_field]))
+            # Cast straight to float - works whether label_field is already a float
+            # score (e.g. a similarity score) or an int class id being repurposed as
+            # a numeric target (e.g. yelp_review_full's 0-4 star rating).
+            targets.append(float(ex[label_field]))
+        return texts, targets
+
+    print("Cleaning train split ...")
+    train_texts, train_targets_raw = clean_split(train_raw)
+
+    # Standardize targets (zero mean, unit std) using train-split statistics only,
+    # to avoid leaking val/test information into the normalization. This is the
+    # same reason encoder --task classify avoids Noam in train.py: a small model
+    # training on raw, unnormalized targets (e.g. always in the hundreds) can make
+    # MSE loss/gradients large enough to destabilize training. mean/std are saved
+    # in meta.json so train.py's checkpoint (and inference.py) can convert
+    # standardized predictions back to the original label scale.
+    target_mean = sum(train_targets_raw) / len(train_targets_raw)
+    variance = sum((t - target_mean) ** 2 for t in train_targets_raw) / len(train_targets_raw)
+    target_std = max(variance ** 0.5, 1e-6)  # floor to avoid a divide-by-zero on a constant target
+    print(f"target stats (train split): mean={target_mean:.4f} std={target_std:.4f}")
+
+    print(f"Training {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(train_texts, args.tokenizer, args.vocab_size)
+    print(f"vocab size: {len(tokenizer)}")
+
+    def encode_and_filter(texts, targets_raw):
+        data = []
+        for text, target in zip(texts, targets_raw):
+            ids = tokenizer.encode(text)
+            if 1 <= len(ids) <= args.max_len:
+                standardized = (target - target_mean) / target_std
+                data.append(([SOS_IDX] + ids, standardized))
+        return data
+
+    data = encode_and_filter(train_texts, train_targets_raw)
+    train, val, test_from_train = split_train_val_test(data)
+
+    if test_raw is not None:
+        print("Cleaning + encoding test split ...")
+        test_texts, test_targets_raw = clean_split(test_raw)
+        test = encode_and_filter(test_texts, test_targets_raw)
+    else:
+        test = test_from_train
+
+    print(f"train={len(train)}  val={len(val)}  test={len(test)}")
+
+    save_split(out_dir, train, val, test)
+    tokenizer.save(os.path.join(out_dir, "tokenizer.json"))
+    save_meta(out_dir, {
+        "mode": "encoder", "task": "regression", "tokenizer": args.tokenizer,
+        "pad_idx": PAD_IDX, "sos_idx": SOS_IDX, "eos_idx": EOS_IDX,
+        "unk_idx": UNK_IDX, "mask_idx": MASK_IDX,
+        "vocab_size": len(tokenizer),
+        "num_targets": 1,
+        "target_mean": target_mean,
+        "target_std": target_std,
+        "max_len": args.max_len + 1,
+    })
+    print(f"Done. Saved to ./{out_dir}/")
+
+
+# --------------------------------------------------------------------------- #
 # Mode 3b: encoder-only, mlm (masked language model pretraining)
 # --------------------------------------------------------------------------- #
 def prepare_encoder_mlm(args):
@@ -635,7 +724,7 @@ def prepare_encoder_mlm(args):
 def build_arg_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True, choices=["encdec", "decoder", "encoder"])
-    p.add_argument("--task", default="classify", choices=["classify", "mlm"],
+    p.add_argument("--task", default="classify", choices=["classify", "mlm", "regression"],
                    help="only used when --mode encoder")
     p.add_argument("--unit", default="stream", choices=["stream", "lines"],
                    help="only used when --mode decoder")
@@ -670,9 +759,11 @@ def build_arg_parser():
     p.add_argument("--source", default=None,
                    help="local text file path (decoder/lines) or corpus override (decoder/stream, encoder/mlm)")
 
-    # encoder/classify-specific
+    # encoder/classify and encoder/regression-specific
     p.add_argument("--text-field", default="text", dest="text_field")
-    p.add_argument("--label-field", default="label", dest="label_field")
+    p.add_argument("--label-field", default="label", dest="label_field",
+                   help="classify: class label field. regression: numeric target field "
+                        "(cast to float, e.g. a rating or score)")
 
     return p
 
@@ -696,6 +787,10 @@ def main():
             if args.dataset is None:
                 args.dataset = "fancyzhx/ag_news"
             prepare_encoder_classify(args)
+        elif args.task == "regression":
+            if args.dataset is None:
+                args.dataset = "yelp_review_full"
+            prepare_encoder_regression(args)
         else:
             prepare_encoder_mlm(args)
 

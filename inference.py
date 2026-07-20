@@ -11,6 +11,7 @@ data_cleaning.py, and lets you play with whichever model you trained.
     python inference.py --mode encoder_classify                     # classify, REPL
     python inference.py --mode encoder_mlm                          # fill-in-the-blank, REPL
                                                                       (use ___ as the blank)
+    python inference.py --mode encoder_regression                   # predict a number from text, REPL
 
 Every mode reuses clean_text + the BPE/char tokenizer classes from
 data_cleaning.py, so preprocessing at inference time matches training exactly.
@@ -30,7 +31,7 @@ import argparse
 
 import torch
 
-from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly
+from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly, TransformerRegression
 from data_cleaning import clean_text, load_tokenizer
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,12 +41,14 @@ DEFAULT_CKPT = {
     "decoder": os.path.join("checkpoints", "decoder", "best.pt"),
     "encoder_classify": os.path.join("checkpoints", "encoder_classify", "best.pt"),
     "encoder_mlm": os.path.join("checkpoints", "encoder_mlm", "best.pt"),
+    "encoder_regression": os.path.join("checkpoints", "encoder_regression", "best.pt"),
 }
 DEFAULT_DATA_DIR = {
     "encdec": os.path.join("data", "encdec"),
     "decoder": os.path.join("data", "decoder"),
     "encoder_classify": os.path.join("data", "encoder_classify"),
     "encoder_mlm": os.path.join("data", "encoder_mlm"),
+    "encoder_regression": os.path.join("data", "encoder_regression"),
 }
 
 
@@ -377,13 +380,71 @@ def run_encoder_mlm(args):
         print()
 
 
+# =========================================================================== #
+# MODE: encoder_regression (predict a number from text)
+# =========================================================================== #
+def build_regression_model(cfg):
+    return TransformerRegression(
+        vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"], num_kv_heads=cfg.get("num_kv_heads"), d_ff=cfg["d_ff"],
+        max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        num_targets=cfg.get("num_targets", 1), pooling=cfg.get("pooling", "mean"),
+        rope_theta=cfg.get("rope_theta", 10000.0),
+    ).to(DEVICE)
+
+
+def run_encoder_regression(args):
+    data_dir = args.data_dir or DEFAULT_DATA_DIR["encoder_regression"]
+    ckpt_path = args.ckpt or DEFAULT_CKPT["encoder_regression"]
+
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        meta = json.load(f)
+    tokenizer = load_tokenizer(os.path.join(data_dir, "tokenizer.json"))
+
+    ckpt, cfg = load_checkpoint(ckpt_path, "encoder_regression")
+    model = build_regression_model(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    # Predictions come out of the model in standardized (zero mean, unit std) units -
+    # the same space training targets were put in by data_cleaning.py. Un-standardize
+    # here so the number shown is back in the original label's scale/units.
+    target_mean = cfg.get("target_mean", 0.0)
+    target_std = cfg.get("target_std", 1.0)
+    unk_idx = meta["unk_idx"]
+    sos_idx = meta["sos_idx"]
+
+    @torch.no_grad()
+    def predict_once(sentence):
+        ids = tokenizer.encode(clean_text(sentence))
+        if not ids:
+            ids = [unk_idx]
+        ids = [sos_idx] + ids
+        x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+        pred_standardized = model(x, task="regress").squeeze(-1).item()
+        return pred_standardized * target_std + target_mean
+
+    if args.text:
+        print(f"{predict_once(args.text):.4f}")
+        return
+
+    print("\nPredict a number from text. Type 'quit' to exit.\n")
+    while True:
+        sentence = input("text > ").strip()
+        if sentence.lower() in ("quit", "exit"):
+            break
+        if not sentence:
+            continue
+        print(f"  -> {predict_once(sentence):.4f}\n")
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_arg_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True,
-                   choices=["encdec", "decoder", "encoder_classify", "encoder_mlm"])
+                   choices=["encdec", "decoder", "encoder_classify", "encoder_mlm", "encoder_regression"])
     p.add_argument("--ckpt", default=None, help="defaults to checkpoints/<mode>/best.pt")
     p.add_argument("--data-dir", default=None, dest="data_dir",
                    help="defaults to data/<mode>/")
@@ -414,6 +475,8 @@ def main():
         run_encoder_classify(args)
     elif args.mode == "encoder_mlm":
         run_encoder_mlm(args)
+    elif args.mode == "encoder_regression":
+        run_encoder_regression(args)
 
 
 if __name__ == "__main__":
