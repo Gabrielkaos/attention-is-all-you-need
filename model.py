@@ -640,6 +640,7 @@ class TransformerEncoderOnly(nn.Module):
         num_classes: int = None,
         pooling: str = "mean",  # "mean" or "cls" (assumes token 0 of each sequence is a [CLS]-like token)
         rope_theta: float = 10000.0,
+        use_mlm_head: bool = True,
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -648,9 +649,17 @@ class TransformerEncoderOnly(nn.Module):
         self.encoder = Encoder(vocab_size, d_model, num_layers, num_heads, d_ff,
                                 num_kv_heads, max_len, dropout, rope_theta)
 
-        # optional heads - leave num_classes=None to just get contextual embeddings back
+        # optional heads - leave num_classes=None to just get contextual embeddings back.
+        # use_mlm_head=False (pass this whenever a model will only ever be trained/used
+        # for task="classify") skips building the head entirely, rather than building it
+        # and leaving it unused - DistributedDataParallel expects *every* parameter to get
+        # a gradient every backward pass, and a head that's built but never called in the
+        # forward path (e.g. mlm_head during classify-only training) trips its "unused
+        # parameters" error/hang. The other direction is already fine as-is: mlm-only
+        # training simply never passes num_classes, so self.classifier is already None
+        # and was never constructed.
         self.classifier = nn.Linear(d_model, num_classes) if num_classes else None
-        self.mlm_head = nn.Linear(d_model, vocab_size)  # handy for masked-LM pretraining
+        self.mlm_head = nn.Linear(d_model, vocab_size) if use_mlm_head else None
         self._init_weights()
 
     def _init_weights(self):
@@ -669,6 +678,8 @@ class TransformerEncoderOnly(nn.Module):
             return hidden
 
         if task == "mlm":
+            if self.mlm_head is None:
+                raise ValueError("mlm_head was not built - construct with use_mlm_head=True to use task='mlm'.")
             return self.mlm_head(hidden)  # (batch, seq_len, vocab_size)
 
         # task == "classify"
