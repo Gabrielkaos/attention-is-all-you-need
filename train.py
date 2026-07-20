@@ -404,8 +404,8 @@ def train_encdec(args):
                 logits = model(src, tgt_in)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
-            backward_step(loss, model, optimizer, scaler, args.grad_clip)
             scheduler.step()
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
 
             # accumulate on-device and only sync to CPU once, after the epoch -
             # a per-batch .item() here would force a GPU sync every single step
@@ -537,8 +537,8 @@ def train_decoder(args):
                 logits = model(x)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
-            backward_step(loss, model, optimizer, scaler, args.grad_clip)
             scheduler.step()
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
 
             n_tok = (y != pad_idx).sum()
             train_loss_sum += loss.detach() * n_tok
@@ -839,8 +839,9 @@ def train_encoder_mlm(args):
                 logits = model(inputs, task="mlm")
                 loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
-            backward_step(loss, model, optimizer, scaler, args.grad_clip)
             scheduler.step()
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+            
 
             n_masked = (labels != -100).sum()
             train_loss_sum += loss.detach() * n_masked
