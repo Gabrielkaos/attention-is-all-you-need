@@ -226,6 +226,10 @@ def build_classify_model(cfg):
         max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
         num_classes=cfg["num_classes"], pooling=cfg.get("pooling", "mean"),
         rope_theta=cfg.get("rope_theta", 10000.0),
+        # Default True (i.e. build the head) for checkpoints saved before use_mlm_head
+        # existed - those state dicts still have mlm_head weights in them, so building
+        # it here keeps load_state_dict from erroring on unexpected keys.
+        use_mlm_head=cfg.get("use_mlm_head", True),
     ).to(DEVICE)
 
 
