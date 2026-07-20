@@ -38,26 +38,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly, default_num_kv_heads
+from model import Transformer, TransformerDecoderOnly, TransformerEncoderOnly
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def resolve_arch_args(args):
-    """Builds the architecture dict shared by all four training modes. Fills in a
-    sensible Grouped-Query-Attention group size (--num-kv-heads) when it isn't given
-    explicitly, and always carries the RoPE base (--rope-theta) along too, so both
-    end up saved into the checkpoint config and reused verbatim by inference.py."""
-    num_kv_heads = args.num_kv_heads or default_num_kv_heads(args.num_heads)
-    if args.num_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"--num-heads ({args.num_heads}) must be divisible by --num-kv-heads ({num_kv_heads})"
-        )
-    return {
-        "d_model": args.d_model, "num_layers": args.num_layers, "num_heads": args.num_heads,
-        "num_kv_heads": num_kv_heads, "d_ff": args.d_ff, "dropout": args.dropout,
-        "rope_theta": args.rope_theta,
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -146,14 +129,16 @@ def train_encdec(args):
 
     resume_ckpt = load_resume(args.resume)
     # if resuming, architecture must match the saved checkpoint - CLI arch flags are ignored
-    arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
 
     model = Transformer(
         src_vocab_size=meta["src_vocab_size"],
         tgt_vocab_size=meta["tgt_vocab_size"],
         d_model=arch["d_model"], num_layers=arch["num_layers"], num_heads=arch["num_heads"],
-        num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"], max_len=meta["max_len"] + 10,
-        dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
+        d_ff=arch["d_ff"], max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
@@ -162,8 +147,7 @@ def train_encdec(args):
 
     config = {
         "mode": "encdec", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
-        "num_heads": arch["num_heads"], "num_kv_heads": arch["num_kv_heads"], "d_ff": arch["d_ff"],
-        "dropout": arch["dropout"], "rope_theta": arch["rope_theta"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "src_vocab_size": meta["src_vocab_size"], "tgt_vocab_size": meta["tgt_vocab_size"],
         "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
     }
@@ -266,12 +250,15 @@ def train_decoder(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
     resume_ckpt = load_resume(args.resume)
-    arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
 
     model = TransformerDecoderOnly(
         vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
-        num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
-        max_len=max_len, dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=max_len,
+        dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
@@ -280,8 +267,7 @@ def train_decoder(args):
 
     config = {
         "mode": "decoder", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
-        "num_heads": arch["num_heads"], "num_kv_heads": arch["num_kv_heads"], "d_ff": arch["d_ff"],
-        "dropout": arch["dropout"], "rope_theta": arch["rope_theta"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": max_len, "pad_idx": pad_idx,
     }
 
@@ -383,13 +369,17 @@ def train_encoder_classify(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
     resume_ckpt = load_resume(args.resume)
-    arch = resume_ckpt["config"] if resume_ckpt else {**resolve_arch_args(args), "pooling": args.pooling}
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+        "pooling": args.pooling,
+    }
 
     model = TransformerEncoderOnly(
         vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
-        num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
-        max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
-        num_classes=meta["num_classes"], pooling=arch["pooling"], rope_theta=arch["rope_theta"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=meta["max_len"] + 10,
+        dropout=arch["dropout"], pad_idx=pad_idx, num_classes=meta["num_classes"],
+        pooling=arch["pooling"],
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
@@ -405,8 +395,7 @@ def train_encoder_classify(args):
 
     config = {
         "mode": "encoder_classify", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
-        "num_heads": arch["num_heads"], "num_kv_heads": arch["num_kv_heads"], "d_ff": arch["d_ff"],
-        "dropout": arch["dropout"], "rope_theta": arch["rope_theta"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": meta["max_len"] + 10, "pad_idx": pad_idx,
         "num_classes": meta["num_classes"], "pooling": arch["pooling"],
         "label_names": meta.get("label_names"),
@@ -534,12 +523,15 @@ def train_encoder_mlm(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
     resume_ckpt = load_resume(args.resume)
-    arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
+    arch = resume_ckpt["config"] if resume_ckpt else {
+        "d_model": args.d_model, "num_layers": args.num_layers,
+        "num_heads": args.num_heads, "d_ff": args.d_ff, "dropout": args.dropout,
+    }
 
     model = TransformerEncoderOnly(
         vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
-        num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
-        max_len=max_len, dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
+        num_heads=arch["num_heads"], d_ff=arch["d_ff"], max_len=max_len,
+        dropout=arch["dropout"], pad_idx=pad_idx,
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -548,8 +540,7 @@ def train_encoder_mlm(args):
 
     config = {
         "mode": "encoder_mlm", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
-        "num_heads": arch["num_heads"], "num_kv_heads": arch["num_kv_heads"], "d_ff": arch["d_ff"],
-        "dropout": arch["dropout"], "rope_theta": arch["rope_theta"],
+        "num_heads": arch["num_heads"], "d_ff": arch["d_ff"], "dropout": arch["dropout"],
         "vocab_size": meta["vocab_size"], "max_len": max_len, "pad_idx": pad_idx,
     }
 
@@ -628,14 +619,8 @@ def build_arg_parser():
     p.add_argument("--d-model", type=int, default=256, dest="d_model")
     p.add_argument("--num-layers", type=int, default=4, dest="num_layers")
     p.add_argument("--num-heads", type=int, default=8, dest="num_heads")
-    p.add_argument("--num-kv-heads", type=int, default=None, dest="num_kv_heads",
-                   help="Grouped-Query-Attention: number of key/value heads (must divide "
-                        "--num-heads). Defaults to a ~4:1 query:kv ratio if omitted; pass "
-                        "the same value as --num-heads to get plain multi-head attention.")
     p.add_argument("--d-ff", type=int, default=1024, dest="d_ff")
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--rope-theta", type=float, default=10000.0, dest="rope_theta",
-                   help="base frequency for the Rotary Position Embedding table")
 
     p.add_argument("--batch-size", type=int, default=64, dest="batch_size")
     p.add_argument("--epochs", type=int, default=20)

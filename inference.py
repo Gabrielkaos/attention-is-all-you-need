@@ -69,7 +69,8 @@ def build_encdec_model(cfg):
     return Transformer(
         src_vocab_size=cfg["src_vocab_size"], tgt_vocab_size=cfg["tgt_vocab_size"],
         d_model=cfg["d_model"], num_layers=cfg["num_layers"], num_heads=cfg["num_heads"],
-        d_ff=cfg["d_ff"], max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        num_kv_heads=cfg.get("num_kv_heads"), d_ff=cfg["d_ff"], max_len=cfg["max_len"],
+        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"], rope_theta=cfg.get("rope_theta", 10000.0),
     ).to(DEVICE)
 
 
@@ -161,8 +162,9 @@ def run_encdec(args):
 def build_decoder_model(cfg):
     return TransformerDecoderOnly(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
-        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
-        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        num_heads=cfg["num_heads"], num_kv_heads=cfg.get("num_kv_heads"), d_ff=cfg["d_ff"],
+        max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
     ).to(DEVICE)
 
 
@@ -182,12 +184,21 @@ def run_decoder(args):
     eos_idx = meta["eos_idx"]
 
     def generate_once(prompt):
+        import time
         prompt_ids = tokenizer.encode(clean_text(prompt))
         if not prompt_ids:
             prompt_ids = [meta["sos_idx"]]
         idx = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
+        t0 = time.perf_counter()
         out = model.generate(idx, max_new_tokens=args.max_new_tokens,
-                              temperature=args.temperature, top_k=args.top_k, eos_idx=eos_idx)
+                              temperature=args.temperature, top_k=args.top_k, eos_idx=eos_idx,
+                              use_cache=not args.no_kv_cache)
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        n_new = out.size(1) - idx.size(1)
+        mode = "no-cache" if args.no_kv_cache else "kv-cache"
+        print(f"  [{mode}: {n_new} new tokens in {elapsed:.3f}s = {n_new / max(elapsed, 1e-9):.1f} tok/s]")
         return tokenizer.decode(out.squeeze(0).tolist())
 
     if args.text:
@@ -208,9 +219,10 @@ def run_decoder(args):
 def build_classify_model(cfg):
     return TransformerEncoderOnly(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
-        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
-        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"], num_classes=cfg["num_classes"],
-        pooling=cfg.get("pooling", "mean"),
+        num_heads=cfg["num_heads"], num_kv_heads=cfg.get("num_kv_heads"), d_ff=cfg["d_ff"],
+        max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        num_classes=cfg["num_classes"], pooling=cfg.get("pooling", "mean"),
+        rope_theta=cfg.get("rope_theta", 10000.0),
     ).to(DEVICE)
 
 
@@ -267,8 +279,9 @@ def run_encoder_classify(args):
 def build_mlm_model(cfg):
     return TransformerEncoderOnly(
         vocab_size=cfg["vocab_size"], d_model=cfg["d_model"], num_layers=cfg["num_layers"],
-        num_heads=cfg["num_heads"], d_ff=cfg["d_ff"], max_len=cfg["max_len"],
-        dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        num_heads=cfg["num_heads"], num_kv_heads=cfg.get("num_kv_heads"), d_ff=cfg["d_ff"],
+        max_len=cfg["max_len"], dropout=cfg["dropout"], pad_idx=cfg["pad_idx"],
+        rope_theta=cfg.get("rope_theta", 10000.0),
     ).to(DEVICE)
 
 
@@ -383,6 +396,9 @@ def build_arg_parser():
     p.add_argument("--max-new-tokens", type=int, default=60, dest="max_new_tokens")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=20, dest="top_k")
+    p.add_argument("--no-kv-cache", action="store_true", dest="no_kv_cache",
+                   help="disable the KV-cache and recompute the full forward pass every "
+                        "step instead (slower - mainly useful for A/B timing the cache itself)")
 
     return p
 
