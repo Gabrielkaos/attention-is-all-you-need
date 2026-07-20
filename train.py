@@ -61,6 +61,94 @@ def resolve_arch_args(args):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-GPU helpers (nn.DataParallel)
+# --------------------------------------------------------------------------- #
+def prepare_model_for_device(model):
+    """Moves model to DEVICE and, if more than one CUDA GPU is visible, wraps it in
+    nn.DataParallel so a single process fans batches out across all of them. On CPU
+    or a single-GPU machine this just moves the model over and returns it unwrapped.
+    Checkpoints always store the *unwrapped* state dict (see save_checkpoint /
+    load_model_state), so switching between 1-GPU and multi-GPU machines across runs
+    is transparent."""
+    model = model.to(DEVICE)
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus > 1:
+        print(f"Found {n_gpus} GPUs -> wrapping model in nn.DataParallel")
+        model = nn.DataParallel(model)
+    elif n_gpus == 1:
+        print("Found 1 GPU -> training on a single GPU (no DataParallel)")
+    else:
+        print("No GPU found -> training on CPU")
+    return model
+
+
+def raw_model(model):
+    """Returns the underlying module whether or not `model` is DataParallel-wrapped.
+    Use this whenever you need to reach model-specific attributes/methods that
+    DataParallel doesn't proxy."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def load_model_state(model, state_dict):
+    """Loads a checkpoint's (always-unwrapped) state dict into `model`, whether or
+    not `model` is currently DataParallel-wrapped."""
+    raw_model(model).load_state_dict(state_dict)
+
+
+# --------------------------------------------------------------------------- #
+# Throughput helpers: these three things matter far more than which GPU you
+# have for a model this small, and are the usual reason "faster" hardware
+# doesn't actually train faster - see the long comment in prepare_model_for_device
+# usage sites and the CLI --num-workers/--amp help text for the full story.
+# --------------------------------------------------------------------------- #
+def dataloader_kwargs(args):
+    """With num_workers=0 (the DataLoader default), every batch's collate_fn
+    (tokenizing/padding, all pure Python) runs in the main process in between
+    training steps, so the GPU sits completely idle waiting for the CPU to
+    build the next batch - a bottleneck whose cost has nothing to do with
+    which GPU you bought, which is why a GTX 1660 Super and a T4 can post the
+    same epoch time. num_workers>0 prefetches batches in background
+    processes while the GPU is busy with the current one; pin_memory copies
+    the finished batch into page-locked host memory so the .to(DEVICE,
+    non_blocking=True) calls below can actually overlap with compute instead
+    of blocking on a synchronous copy."""
+    return dict(
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+    )
+
+
+def autocast_ctx(args):
+    """Mixed-precision context (fp16 autocast), enabled only when --amp is
+    passed and a GPU is present. This is what actually engages a T4's Tensor
+    Cores for the matmuls inside attention/FFN - without it, training runs in
+    plain fp32 and Tensor Cores never get used, which is a second reason a
+    "much more capable" GPU can post the same wall-clock time as an older
+    one. (A GTX 1660 Super has no Tensor Cores at all, so --amp helps it far
+    less - expect the gap between the two GPUs to actually show up once this
+    is on.)"""
+    enabled = args.amp and DEVICE.type == "cuda"
+    dtype = torch.float16 if DEVICE.type == "cuda" else torch.bfloat16
+    return torch.autocast(device_type=DEVICE.type, dtype=dtype, enabled=enabled)
+
+
+def make_grad_scaler(args):
+    return torch.cuda.amp.GradScaler(enabled=args.amp and DEVICE.type == "cuda")
+
+
+def backward_step(loss, model, optimizer, scaler, grad_clip):
+    """One optimizer update, with or without AMP's loss scaling. scaler is a
+    no-op passthrough when --amp wasn't passed (see make_grad_scaler)."""
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+
+
+# --------------------------------------------------------------------------- #
 # Noam learning-rate schedule (shared across all modes)
 # --------------------------------------------------------------------------- #
 class NoamScheduler:
@@ -83,7 +171,7 @@ class NoamScheduler:
 def save_checkpoint(ckpt_dir, name, model, optimizer, scheduler, config, epoch, metric):
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save({
-        "model_state": model.state_dict(),
+        "model_state": raw_model(model).state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_step": scheduler.step_num if scheduler is not None else None,
         "config": config,
@@ -141,8 +229,9 @@ def train_encdec(args):
     val_ds = EncDecDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_encdec(b, pad_idx)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    loader_kwargs = dataloader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
 
     resume_ckpt = load_resume(args.resume)
     # if resuming, architecture must match the saved checkpoint - CLI arch flags are ignored
@@ -154,11 +243,13 @@ def train_encdec(args):
         d_model=arch["d_model"], num_layers=arch["num_layers"], num_heads=arch["num_heads"],
         num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"], max_len=meta["max_len"] + 10,
         dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
-    ).to(DEVICE)
+    )
+    model = prepare_model_for_device(model)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
+    scaler = make_grad_scaler(args)
 
     config = {
         "mode": "encdec", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
@@ -171,7 +262,7 @@ def train_encdec(args):
     start_epoch = 1
     best_val = float("inf")
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        load_model_state(model, resume_ckpt["model_state"])
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
@@ -182,37 +273,42 @@ def train_encdec(args):
         start = time.time()
 
         model.train()
-        train_loss, train_tokens = 0.0, 0
+        train_loss_sum = torch.zeros((), device=DEVICE)
+        train_tokens_sum = torch.zeros((), device=DEVICE)
         for src, tgt in train_loader:
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+            src = src.to(DEVICE, non_blocking=True)
+            tgt = tgt.to(DEVICE, non_blocking=True)
             tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
 
-            logits = model(src, tgt_in)
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            scheduler.step()
-
-            n_tok = (tgt_out != pad_idx).sum().item()
-            train_loss += loss.item() * n_tok
-            train_tokens += n_tok
-        train_loss /= max(train_tokens, 1)
-
-        model.eval()
-        val_loss, val_tokens = 0.0, 0
-        with torch.no_grad():
-            for src, tgt in val_loader:
-                src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-                tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
+            with autocast_ctx(args):
                 logits = model(src, tgt_in)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-                n_tok = (tgt_out != pad_idx).sum().item()
-                val_loss += loss.item() * n_tok
-                val_tokens += n_tok
-        val_loss /= max(val_tokens, 1)
+
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+            scheduler.step()
+
+            # accumulate on-device and only sync to CPU once, after the epoch -
+            # a per-batch .item() here would force a GPU sync every single step
+            n_tok = (tgt_out != pad_idx).sum()
+            train_loss_sum += loss.detach() * n_tok
+            train_tokens_sum += n_tok
+        train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
+
+        model.eval()
+        val_loss_sum = torch.zeros((), device=DEVICE)
+        val_tokens_sum = torch.zeros((), device=DEVICE)
+        with torch.no_grad():
+            for src, tgt in val_loader:
+                src = src.to(DEVICE, non_blocking=True)
+                tgt = tgt.to(DEVICE, non_blocking=True)
+                tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
+                with autocast_ctx(args):
+                    logits = model(src, tgt_in)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                n_tok = (tgt_out != pad_idx).sum()
+                val_loss_sum += loss.detach() * n_tok
+                val_tokens_sum += n_tok
+        val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
 
         print(f"[encdec] epoch {epoch:02d} | train_loss {train_loss:.4f} "
               f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
@@ -262,8 +358,9 @@ def train_decoder(args):
     val_ds = LMDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_lm(b, pad_idx)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    loader_kwargs = dataloader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
@@ -272,11 +369,13 @@ def train_decoder(args):
         vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
         num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
         max_len=max_len, dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
-    ).to(DEVICE)
+    )
+    model = prepare_model_for_device(model)
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
+    scaler = make_grad_scaler(args)
 
     config = {
         "mode": "decoder", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
@@ -288,7 +387,7 @@ def train_decoder(args):
     start_epoch = 1
     best_val = float("inf")
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        load_model_state(model, resume_ckpt["model_state"])
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
@@ -299,37 +398,38 @@ def train_decoder(args):
         start = time.time()
 
         model.train()
-        train_loss, train_tokens = 0.0, 0
+        train_loss_sum = torch.zeros((), device=DEVICE)
+        train_tokens_sum = torch.zeros((), device=DEVICE)
         for batch in train_loader:
-            batch = batch.to(DEVICE)
+            batch = batch.to(DEVICE, non_blocking=True)
             x, y = batch[:, :-1], batch[:, 1:]  # next-token prediction
 
-            logits = model(x)
-            loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            scheduler.step()
-
-            n_tok = (y != pad_idx).sum().item()
-            train_loss += loss.item() * n_tok
-            train_tokens += n_tok
-        train_loss /= max(train_tokens, 1)
-
-        model.eval()
-        val_loss, val_tokens = 0.0, 0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(DEVICE)
-                x, y = batch[:, :-1], batch[:, 1:]
+            with autocast_ctx(args):
                 logits = model(x)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                n_tok = (y != pad_idx).sum().item()
-                val_loss += loss.item() * n_tok
-                val_tokens += n_tok
-        val_loss /= max(val_tokens, 1)
+
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+            scheduler.step()
+
+            n_tok = (y != pad_idx).sum()
+            train_loss_sum += loss.detach() * n_tok
+            train_tokens_sum += n_tok
+        train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
+
+        model.eval()
+        val_loss_sum = torch.zeros((), device=DEVICE)
+        val_tokens_sum = torch.zeros((), device=DEVICE)
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(DEVICE, non_blocking=True)
+                x, y = batch[:, :-1], batch[:, 1:]
+                with autocast_ctx(args):
+                    logits = model(x)
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                n_tok = (y != pad_idx).sum()
+                val_loss_sum += loss.detach() * n_tok
+                val_tokens_sum += n_tok
+        val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
 
         print(f"[decoder] epoch {epoch:02d} | train_loss {train_loss:.4f} "
               f"(ppl {math.exp(min(train_loss, 20)):.2f}) | val_loss {val_loss:.4f} "
@@ -379,8 +479,9 @@ def train_encoder_classify(args):
     val_ds = ClassifyDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_classify(b, pad_idx)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    loader_kwargs = dataloader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else {**resolve_arch_args(args), "pooling": args.pooling}
@@ -390,7 +491,8 @@ def train_encoder_classify(args):
         num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
         max_len=meta["max_len"] + 10, dropout=arch["dropout"], pad_idx=pad_idx,
         num_classes=meta["num_classes"], pooling=arch["pooling"], rope_theta=arch["rope_theta"],
-    ).to(DEVICE)
+    )
+    model = prepare_model_for_device(model)
 
     criterion = nn.CrossEntropyLoss()
     # NOTE: classification does NOT use the shared Noam schedule. Noam was tuned for
@@ -402,6 +504,7 @@ def train_encoder_classify(args):
     # recipe for fine-tuning/training small Transformer classifiers instead.
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = None
+    scaler = make_grad_scaler(args)
 
     config = {
         "mode": "encoder_classify", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
@@ -415,7 +518,7 @@ def train_encoder_classify(args):
     start_epoch = 1
     best_val_acc = 0.0
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        load_model_state(model, resume_ckpt["model_state"])
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
         start_epoch = resume_ckpt["epoch"] + 1
         best_val_acc = resume_ckpt["metric"]
@@ -425,36 +528,43 @@ def train_encoder_classify(args):
         start = time.time()
 
         model.train()
-        train_loss, train_correct, train_total = 0.0, 0, 0
+        train_loss_sum = torch.zeros((), device=DEVICE)
+        train_correct_sum = torch.zeros((), device=DEVICE)
+        train_total = 0
         for tokens, labels in train_loader:
-            tokens, labels = tokens.to(DEVICE), labels.to(DEVICE)
+            tokens = tokens.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
 
-            logits = model(tokens, task="classify")
-            loss = criterion(logits, labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-
-            train_loss += loss.item() * tokens.size(0)
-            train_correct += (logits.argmax(-1) == labels).sum().item()
-            train_total += tokens.size(0)
-        train_loss /= max(train_total, 1)
-        train_acc = train_correct / max(train_total, 1)
-
-        model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for tokens, labels in val_loader:
-                tokens, labels = tokens.to(DEVICE), labels.to(DEVICE)
+            with autocast_ctx(args):
                 logits = model(tokens, task="classify")
                 loss = criterion(logits, labels)
-                val_loss += loss.item() * tokens.size(0)
-                val_correct += (logits.argmax(-1) == labels).sum().item()
-                val_total += tokens.size(0)
-        val_loss /= max(val_total, 1)
-        val_acc = val_correct / max(val_total, 1)
+
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+
+            bs = tokens.size(0)  # plain python int, shape metadata only - no sync
+            train_loss_sum += loss.detach() * bs
+            train_correct_sum += (logits.argmax(-1) == labels).sum()
+            train_total += bs
+        train_loss = (train_loss_sum / max(train_total, 1)).item()
+        train_acc = (train_correct_sum / max(train_total, 1)).item()
+
+        model.eval()
+        val_loss_sum = torch.zeros((), device=DEVICE)
+        val_correct_sum = torch.zeros((), device=DEVICE)
+        val_total = 0
+        with torch.no_grad():
+            for tokens, labels in val_loader:
+                tokens = tokens.to(DEVICE, non_blocking=True)
+                labels = labels.to(DEVICE, non_blocking=True)
+                with autocast_ctx(args):
+                    logits = model(tokens, task="classify")
+                    loss = criterion(logits, labels)
+                bs = tokens.size(0)
+                val_loss_sum += loss.detach() * bs
+                val_correct_sum += (logits.argmax(-1) == labels).sum()
+                val_total += bs
+        val_loss = (val_loss_sum / max(val_total, 1)).item()
+        val_acc = (val_correct_sum / max(val_total, 1)).item()
 
         print(f"[encoder/classify] epoch {epoch:02d} | train_loss {train_loss:.4f} acc {train_acc:.3f} "
               f"| val_loss {val_loss:.4f} acc {val_acc:.3f} | lr {optimizer.param_groups[0]['lr']:.6f} "
@@ -530,8 +640,9 @@ def train_encoder_mlm(args):
     val_ds = MLMDataset(os.path.join(data_dir, "val.pkl"))
 
     collate = lambda b: collate_mlm(b, pad_idx)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+    loader_kwargs = dataloader_kwargs(args)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, **loader_kwargs)
 
     resume_ckpt = load_resume(args.resume)
     arch = resume_ckpt["config"] if resume_ckpt else resolve_arch_args(args)
@@ -540,11 +651,13 @@ def train_encoder_mlm(args):
         vocab_size=meta["vocab_size"], d_model=arch["d_model"], num_layers=arch["num_layers"],
         num_heads=arch["num_heads"], num_kv_heads=arch["num_kv_heads"], d_ff=arch["d_ff"],
         max_len=max_len, dropout=arch["dropout"], pad_idx=pad_idx, rope_theta=arch["rope_theta"],
-    ).to(DEVICE)
+    )
+    model = prepare_model_for_device(model)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, arch["d_model"], args.warmup_steps)
+    scaler = make_grad_scaler(args)
 
     config = {
         "mode": "encoder_mlm", "d_model": arch["d_model"], "num_layers": arch["num_layers"],
@@ -556,7 +669,7 @@ def train_encoder_mlm(args):
     start_epoch = 1
     best_val = float("inf")
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
+        load_model_state(model, resume_ckpt["model_state"])
         optimizer.load_state_dict(resume_ckpt["optimizer_state"])
         scheduler.step_num = resume_ckpt.get("scheduler_step", 0)
         start_epoch = resume_ckpt["epoch"] + 1
@@ -567,37 +680,38 @@ def train_encoder_mlm(args):
         start = time.time()
 
         model.train()
-        train_loss, train_masked = 0.0, 0
+        train_loss_sum = torch.zeros((), device=DEVICE)
+        train_masked_sum = torch.zeros((), device=DEVICE)
         for batch in train_loader:
-            batch = batch.to(DEVICE)
+            batch = batch.to(DEVICE, non_blocking=True)
             inputs, labels = mask_tokens(batch, mask_idx, meta["vocab_size"], pad_idx)
 
-            logits = model(inputs, task="mlm")
-            loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            scheduler.step()
-
-            n_masked = (labels != -100).sum().item()
-            train_loss += loss.item() * n_masked
-            train_masked += n_masked
-        train_loss /= max(train_masked, 1)
-
-        model.eval()
-        val_loss, val_masked = 0.0, 0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(DEVICE)
-                inputs, labels = mask_tokens(batch, mask_idx, meta["vocab_size"], pad_idx)
+            with autocast_ctx(args):
                 logits = model(inputs, task="mlm")
                 loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
-                n_masked = (labels != -100).sum().item()
-                val_loss += loss.item() * n_masked
-                val_masked += n_masked
-        val_loss /= max(val_masked, 1)
+
+            backward_step(loss, model, optimizer, scaler, args.grad_clip)
+            scheduler.step()
+
+            n_masked = (labels != -100).sum()
+            train_loss_sum += loss.detach() * n_masked
+            train_masked_sum += n_masked
+        train_loss = (train_loss_sum / train_masked_sum.clamp(min=1)).item()
+
+        model.eval()
+        val_loss_sum = torch.zeros((), device=DEVICE)
+        val_masked_sum = torch.zeros((), device=DEVICE)
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(DEVICE, non_blocking=True)
+                inputs, labels = mask_tokens(batch, mask_idx, meta["vocab_size"], pad_idx)
+                with autocast_ctx(args):
+                    logits = model(inputs, task="mlm")
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+                n_masked = (labels != -100).sum()
+                val_loss_sum += loss.detach() * n_masked
+                val_masked_sum += n_masked
+        val_loss = (val_loss_sum / val_masked_sum.clamp(min=1)).item()
 
         print(f"[encoder/mlm] epoch {epoch:02d} | train_loss {train_loss:.4f} "
               f"| val_loss {val_loss:.4f} | {time.time()-start:.1f}s")
@@ -639,6 +753,17 @@ def build_arg_parser():
 
     p.add_argument("--batch-size", type=int, default=64, dest="batch_size")
     p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--num-workers", type=int, default=4, dest="num_workers",
+                   help="DataLoader background worker processes. With 0, batch "
+                        "collation runs on the main process between training steps and "
+                        "the GPU sits idle waiting for it - usually the real reason a "
+                        "faster GPU doesn't train faster on a small model like this one.")
+    p.add_argument("--amp", action="store_true",
+                   help="Enable automatic mixed precision (fp16 autocast + gradient "
+                        "scaling). This is what actually engages Tensor Cores on "
+                        "Turing/Ampere+ GPUs (e.g. T4, A100); without it those cores sit "
+                        "unused and training runs in plain fp32. A GTX 1660 Super has no "
+                        "Tensor Cores, so it benefits much less from this flag.")
     p.add_argument("--warmup-steps", type=int, default=4000, dest="warmup_steps",
                    help="only used by encdec / decoder / encoder-mlm (Noam schedule)")
     p.add_argument("--label-smoothing", type=float, default=0.1, dest="label_smoothing")
