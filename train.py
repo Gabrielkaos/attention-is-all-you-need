@@ -134,7 +134,7 @@ def autocast_ctx(args):
 
 
 def make_grad_scaler(args):
-    return torch.cuda.amp.GradScaler(enabled=args.amp and DEVICE.type == "cuda")
+    return torch.amp.GradScaler(DEVICE.type,enabled=args.amp and DEVICE.type == "cuda")
 
 
 def backward_step(loss, model, optimizer, scaler, grad_clip):
