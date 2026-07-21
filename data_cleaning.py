@@ -43,14 +43,21 @@ Three modes, matching train.py's three modes:
       split only) before saving; the mean/std are stored in meta.json so
       train.py/inference.py can convert predictions back to the original scale.
 
-Tokenization: --tokenizer {bpe,char}, default bpe.
-  bpe  : a from-scratch Byte-Pair-Encoding tokenizer (Sennrich et al. style) -
-         learns subword merges from your training corpus. --vocab-size controls
-         how many merges it learns (bigger = more whole-word tokens, fewer
-         tokens per sentence, but a bigger embedding table).
-  char : every individual character is its own token. No training needed,
-         vocab size is just however many unique characters appear in the
-         corpus. Simpler, longer sequences, easier to reason about.
+Tokenization: --tokenizer {tiktoken,char}, default tiktoken.
+  tiktoken : uses a pretrained OpenAI tiktoken encoding (--tiktoken-encoding,
+             default "cl100k_base") as a fixed subword vocabulary - nothing is
+             learned/trained. We scan your corpus once with that encoding and
+             keep only the token ids that actually show up (e.g. your corpus
+             might only ever produce 30k of cl100k_base's ~100k possible
+             tokens) - the unused ~70k rows are simply never added to the
+             embedding table. Because of this, --vocab-size does NOT apply to
+             this tokenizer: the vocab size is whatever comes out of that scan,
+             not a target you pick. Any token encountered later (val/test, or
+             inference) that wasn't seen during the training-corpus scan maps
+             to <unk>, same as an unseen character would for --tokenizer char.
+  char     : every individual character is its own token. No training needed,
+             vocab size is just however many unique characters appear in the
+             corpus. Simpler, longer sequences, easier to reason about.
 
 Text is NOT lowercased and is not restricted to a fixed character whitelist -
 both tokenizers handle arbitrary characters/case natively, so cleaning here
@@ -60,9 +67,13 @@ Every mode writes to its own subfolder under ./data/<mode_name>/ with
 train.pkl / val.pkl / test.pkl, tokenizer json(s), and a meta.json describing
 everything train.py needs to reconstruct the right model.
 
+Requires the `tiktoken` package (`pip install tiktoken`). The first time a
+given --tiktoken-encoding is used on a machine, tiktoken downloads and caches
+it locally, so that first run needs internet access.
+
 Examples:
     python data_cleaning.py --mode encdec
-    python data_cleaning.py --mode decoder --unit stream                       # Tiny Shakespeare, BPE
+    python data_cleaning.py --mode decoder --unit stream                       # Tiny Shakespeare, tiktoken
     python data_cleaning.py --mode decoder --unit stream --tokenizer char      # same corpus, char-level
     python data_cleaning.py --mode decoder --unit lines --source names.txt
     python data_cleaning.py --mode decoder --unit lines --dataset ag_news --text-field text --max-len 64
@@ -79,8 +90,8 @@ import pickle
 import random
 import argparse
 import urllib.request
-from collections import Counter
 
+import tiktoken
 from tqdm import tqdm
 from datasets import load_dataset
 
@@ -113,12 +124,6 @@ def clean_text(text: str) -> str:
     text = text.strip()
     text = _WHITESPACE_RE.sub(" ", text)
     return text
-
-
-# Pre-tokenizer used only internally by BPE, to stop merges from ever crossing
-# a word/punctuation/whitespace boundary. \w and \s are unicode-aware in
-# Python's re module, so this handles accented letters etc. too.
-_PRETOKEN_RE = re.compile(r"\w+|[^\w\s]|\s+", re.UNICODE)
 
 
 # --------------------------------------------------------------------------- #
@@ -162,147 +167,84 @@ class CharTokenizer:
 
 
 # --------------------------------------------------------------------------- #
-# BPE tokenizer, trained from scratch on your corpus (classic Sennrich et al.
-# algorithm): start from individual characters, repeatedly merge the most
-# frequent adjacent pair, until the target vocab size is reached. Merges never
-# cross a pre-token boundary (word / punctuation / whitespace-run), so it
-# won't glue together things like "the" + " cat" into one nonsense unit.
+# Tiktoken-backed tokenizer: no training/merge-learning at all - the subword
+# vocabulary comes from a pretrained OpenAI tiktoken encoding (e.g.
+# "cl100k_base", the GPT-3.5/4 encoding). The only thing "trained" here is
+# which of that encoding's ~100k token ids actually appear in your corpus;
+# ids that never show up are simply excluded from the embedding table instead
+# of being carried around unused. So if your corpus only ever produces, say,
+# 30k distinct tiktoken ids, your model's vocab size is ~30k (+ specials),
+# not 100k. --vocab-size is ignored by this tokenizer for that reason - there's
+# no merge count to target, only "whatever ids the corpus actually uses".
 # --------------------------------------------------------------------------- #
-class BPETokenizer:
-    def __init__(self, itos, merges):
-        self.itos = itos
-        self.stoi = {tok: i for i, tok in enumerate(itos)}
-        self.merges = [tuple(m) for m in merges]  # in the order they were learned
-        self.merge_rank = {pair: i for i, pair in enumerate(self.merges)}
+class TiktokenTokenizer:
+    def __init__(self, encoding_name, used_ids):
+        self.encoding_name = encoding_name
+        self.enc = tiktoken.get_encoding(encoding_name)
+        # itos[i] for i >= len(SPECIALS) is the underlying tiktoken token id
+        # that local id `i` refers to.
+        self.itos = list(SPECIALS) + list(used_ids)
+        # tiktoken_id -> local id, only for ids we actually kept.
+        self.tok_to_local = {
+            tok_id: len(SPECIALS) + i for i, tok_id in enumerate(used_ids)
+        }
 
-    # ------------------------- training ------------------------- #
     @classmethod
-    def train(cls, texts, vocab_size=3000):
-        word_freq = Counter()
-        for t in texts:
-            word_freq.update(_PRETOKEN_RE.findall(t))
-
-        word_splits = {w: list(w) for w in word_freq}
-
-        base_vocab = set()
-        for symbols in word_splits.values():
-            base_vocab.update(symbols)
-
-        num_merges_target = max(0, vocab_size - len(SPECIALS) - len(base_vocab))
-
-        pair_counts, pair_to_words = cls._count_pairs(word_splits, word_freq)
-        merges = []
-
-        for _ in tqdm(range(num_merges_target), desc="learning BPE merges"):
-            if not pair_counts:
-                break
-            best_pair = max(pair_counts, key=pair_counts.get)
-            merges.append(best_pair)
-
-            affected_words = list(pair_to_words.get(best_pair, ()))
-            for w in affected_words:
-                symbols = word_splits[w]
-                freq = word_freq[w]
-
-                for i in range(len(symbols) - 1):
-                    p = (symbols[i], symbols[i + 1])
-                    pair_counts[p] -= freq
-                    if pair_counts[p] <= 0:
-                        del pair_counts[p]
-                    if p in pair_to_words:
-                        pair_to_words[p].discard(w)
-
-                new_symbols = cls._merge_symbols(symbols, best_pair)
-                word_splits[w] = new_symbols
-
-                for i in range(len(new_symbols) - 1):
-                    p = (new_symbols[i], new_symbols[i + 1])
-                    pair_counts[p] += freq
-                    pair_to_words.setdefault(p, set()).add(w)
-
-        merged_vocab = set(base_vocab)
-        for a, b in merges:
-            merged_vocab.add(a + b)
-
-        itos = list(SPECIALS) + sorted(merged_vocab)
-        return cls(itos, merges)
-
-    @staticmethod
-    def _count_pairs(word_splits, word_freq):
-        pair_counts = Counter()
-        pair_to_words = {}
-        for w, symbols in word_splits.items():
-            freq = word_freq[w]
-            for i in range(len(symbols) - 1):
-                p = (symbols[i], symbols[i + 1])
-                pair_counts[p] += freq
-                pair_to_words.setdefault(p, set()).add(w)
-        return pair_counts, pair_to_words
-
-    @staticmethod
-    def _merge_symbols(symbols, pair):
-        a, b = pair
-        merged = []
-        i = 0
-        while i < len(symbols):
-            if i < len(symbols) - 1 and symbols[i] == a and symbols[i + 1] == b:
-                merged.append(a + b)
-                i += 2
-            else:
-                merged.append(symbols[i])
-                i += 1
-        return merged
-
-    # ------------------------- encode / decode ------------------------- #
-    def _bpe_word(self, chunk):
-        symbols = list(chunk)
-        while len(symbols) > 1:
-            pairs = [(symbols[i], symbols[i + 1]) for i in range(len(symbols) - 1)]
-            ranked = [(self.merge_rank[p], p) for p in pairs if p in self.merge_rank]
-            if not ranked:
-                break
-            _, best_pair = min(ranked)
-            symbols = self._merge_symbols(symbols, best_pair)
-        return symbols
+    def train(cls, texts, encoding_name="cl100k_base"):
+        enc = tiktoken.get_encoding(encoding_name)
+        used = set()
+        for t in tqdm(texts, desc=f"scanning corpus with tiktoken ({encoding_name})"):
+            used.update(enc.encode(t, disallowed_special=()))
+        used_ids = sorted(used)
+        return cls(encoding_name, used_ids)
 
     def encode(self, text: str):
-        ids = []
-        for chunk in _PRETOKEN_RE.findall(text):
-            for sym in self._bpe_word(chunk):
-                ids.append(self.stoi.get(sym, UNK_IDX))
-        return ids
+        # disallowed_special=() tells tiktoken to treat every one of its own
+        # reserved special strings (e.g. "<|endoftext|>") as ordinary text if
+        # it happens to appear in the corpus, instead of raising or special-
+        # casing it - we only ever want *our* SPECIALS (<pad>/<sos>/<eos>/
+        # <unk>/<mask>), never tiktoken's.
+        raw_ids = self.enc.encode(text, disallowed_special=())
+        # A raw id that never showed up during the training-corpus scan (only
+        # possible on val/test/inference text) maps to <unk>, same as an
+        # unseen character would for CharTokenizer.
+        return [self.tok_to_local.get(i, UNK_IDX) for i in raw_ids]
 
     def decode(self, ids):
-        return "".join(
+        raw_ids = [
             self.itos[i] for i in ids
-            if i < len(self.itos) and self.itos[i] not in SPECIALS
-        )
+            if i < len(self.itos) and i >= len(SPECIALS)
+        ]
+        return self.enc.decode(raw_ids)
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"type": "bpe", "itos": self.itos, "merges": self.merges},
-                       f, ensure_ascii=False, indent=2)
+            json.dump({
+                "type": "tiktoken",
+                "encoding_name": self.encoding_name,
+                "used_ids": self.itos[len(SPECIALS):],
+            }, f, indent=2)
 
     @classmethod
     def load(cls, path):
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
-        return cls(d["itos"], d["merges"])
+        return cls(d["encoding_name"], d["used_ids"])
 
     def __len__(self):
         return len(self.itos)
 
 
-def train_tokenizer(texts, kind: str, vocab_size: int):
+def train_tokenizer(texts, kind: str, encoding_name: str = "cl100k_base"):
     if kind == "char":
         return CharTokenizer.train(texts)
-    return BPETokenizer.train(texts, vocab_size=vocab_size)
+    return TiktokenTokenizer.train(texts, encoding_name=encoding_name)
 
 
 def load_tokenizer(path):
     with open(path, "r", encoding="utf-8") as f:
         d = json.load(f)
-    return CharTokenizer.load(path) if d["type"] == "char" else BPETokenizer.load(path)
+    return CharTokenizer.load(path) if d["type"] == "char" else TiktokenTokenizer.load(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -376,9 +318,9 @@ def prepare_encdec(args):
             src_texts.append(clean_text(pair[args.src_lang]))
             tgt_texts.append(clean_text(pair[args.tgt_lang]))
 
-    print(f"Training {args.tokenizer} tokenizers (src + tgt) ...")
-    src_tokenizer = train_tokenizer(src_texts, args.tokenizer, args.vocab_size)
-    tgt_tokenizer = train_tokenizer(tgt_texts, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizers (src + tgt) ...")
+    src_tokenizer = train_tokenizer(src_texts, args.tokenizer, args.tiktoken_encoding)
+    tgt_tokenizer = train_tokenizer(tgt_texts, args.tokenizer, args.tiktoken_encoding)
     print(f"src vocab size: {len(src_tokenizer)} | tgt vocab size: {len(tgt_tokenizer)}")
 
     print("Encoding + filtering by length ...")
@@ -470,8 +412,8 @@ def prepare_decoder_stream(args):
         lines = [clean_text(line) for line in raw_lines if clean_text(line)]
         source_desc = source_path
 
-    print(f"Training {args.tokenizer} tokenizer ...")
-    tokenizer = train_tokenizer(lines, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(lines, args.tokenizer, args.tiktoken_encoding)
     print(f"vocab size: {len(tokenizer)}")
 
     print("Encoding corpus ...")
@@ -528,8 +470,8 @@ def prepare_decoder_lines(args):
         lines = _load_hf_text_rows(args.dataset, args.text_field)
         source_desc = f"hf:{args.dataset}"
 
-    print(f"Training {args.tokenizer} tokenizer ...")
-    tokenizer = train_tokenizer(lines, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(lines, args.tokenizer, args.tiktoken_encoding)
     print(f"vocab size: {len(tokenizer)}")
 
     print(f"Encoding + filtering by length (max_len={args.max_len}) ...")
@@ -604,8 +546,8 @@ def prepare_encoder_classify(args):
 
     print(f"classes ({len(label_names)}): {label_names}")
 
-    print(f"Training {args.tokenizer} tokenizer ...")
-    tokenizer = train_tokenizer(train_texts, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(train_texts, args.tokenizer, args.tiktoken_encoding)
     print(f"vocab size: {len(tokenizer)}")
 
     def encode_and_filter(texts, labels_raw):
@@ -721,8 +663,8 @@ def prepare_encoder_regression(args):
     target_std = max(variance ** 0.5, 1e-6)  # floor to avoid a divide-by-zero on a constant target
     print(f"target stats (train split): mean={target_mean:.4f} std={target_std:.4f}")
 
-    print(f"Training {args.tokenizer} tokenizer ...")
-    tokenizer = train_tokenizer(train_texts, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(train_texts, args.tokenizer, args.tiktoken_encoding)
     print(f"vocab size: {len(tokenizer)}")
 
     def encode_and_filter(texts, targets_raw):
@@ -784,8 +726,8 @@ def prepare_encoder_mlm(args):
 
     lines = [clean_text(line) for line in raw_lines if clean_text(line)]
 
-    print(f"Training {args.tokenizer} tokenizer ...")
-    tokenizer = train_tokenizer(lines, args.tokenizer, args.vocab_size)
+    print(f"Building {args.tokenizer} tokenizer ...")
+    tokenizer = train_tokenizer(lines, args.tokenizer, args.tiktoken_encoding)
     print(f"vocab size: {len(tokenizer)}")
 
     print("Encoding corpus ...")
@@ -832,11 +774,21 @@ def build_arg_parser():
     p.add_argument("--block-size", type=int, default=64, dest="block_size",
                    help="sequence length for decoder/stream and encoder/mlm chunking")
 
-    p.add_argument("--tokenizer", default="bpe", choices=["bpe", "char"],
-                   help="bpe (default): learn subword merges from the corpus. "
+    p.add_argument("--tokenizer", default="tiktoken", choices=["tiktoken", "char"],
+                   help="tiktoken (default): use a pretrained OpenAI tiktoken encoding "
+                        "(see --tiktoken-encoding) as a fixed subword vocab, but only keep "
+                        "the token ids that actually appear in your corpus - nothing is "
+                        "learned/merged, so --vocab-size does not apply to it. "
                         "char: every character is its own token, no training needed.")
+    p.add_argument("--tiktoken-encoding", default="cl100k_base", dest="tiktoken_encoding",
+                   help="which pretrained tiktoken encoding to draw tokens from when "
+                        "--tokenizer tiktoken is used, e.g. cl100k_base (GPT-3.5/4) or "
+                        "o200k_base (GPT-4o). Ignored for --tokenizer char.")
     p.add_argument("--vocab-size", type=int, default=3000, dest="vocab_size",
-                   help="target vocab size for --tokenizer bpe (ignored for char)")
+                   help="[unused - kept only for backwards-compatible CLI calls] vocab "
+                        "size is no longer a target: --tokenizer tiktoken keeps exactly "
+                        "the token ids seen in your corpus, and --tokenizer char keeps "
+                        "exactly the characters seen in your corpus.")
 
     # encdec-specific
     p.add_argument("--dataset", default=None,
