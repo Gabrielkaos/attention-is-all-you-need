@@ -12,9 +12,14 @@ Three modes, matching train.py's three modes:
       Plain text corpus for the GPT-style TransformerDecoderOnly - next-token
       prediction. Two sub-modes via --unit:
         stream : one long corpus chunked into fixed-length blocks
-                 (e.g. Tiny Shakespeare - default, auto-downloaded)
+                 (e.g. Tiny Shakespeare - default, auto-downloaded; or a
+                 Hugging Face dataset via --dataset, rows concatenated
+                 together before chunking)
         lines  : one example per line, independently padded
-                 (e.g. a names.txt / poems.txt file you supply with --source)
+                 (e.g. a names.txt / poems.txt file you supply with --source,
+                 or a Hugging Face dataset via --dataset, one row per line -
+                 --max-len filters out rows whose encoded length falls
+                 outside [1, max_len])
 
   --mode encoder --task classify
       Labeled classification data for TransformerEncoderOnly.
@@ -60,6 +65,8 @@ Examples:
     python data_cleaning.py --mode decoder --unit stream                       # Tiny Shakespeare, BPE
     python data_cleaning.py --mode decoder --unit stream --tokenizer char      # same corpus, char-level
     python data_cleaning.py --mode decoder --unit lines --source names.txt
+    python data_cleaning.py --mode decoder --unit lines --dataset ag_news --text-field text --max-len 64
+    python data_cleaning.py --mode decoder --unit stream --dataset wikitext --text-field text
     python data_cleaning.py --mode encoder --task classify
     python data_cleaning.py --mode encoder --task mlm
     python data_cleaning.py --mode encoder --task regression
@@ -420,19 +427,48 @@ def _download_tiny_shakespeare(dest_path):
     return dest_path
 
 
+def _load_hf_text_rows(dataset_name, text_field, split="train"):
+    """Load a Hugging Face dataset and pull out one cleaned string per row
+    from `text_field`. Shared by decoder/stream and decoder/lines so both
+    can source their corpus from the Hub instead of (or in addition to) a
+    local file."""
+    print(f"Loading {dataset_name} from Hugging Face (split={split}) ...")
+    raw = load_dataset(dataset_name)
+    if split not in raw:
+        raise ValueError(
+            f"Split '{split}' not found in {dataset_name} - available splits: {list(raw.keys())}"
+        )
+    rows = raw[split]
+    print("Cleaning text ...")
+    texts = [clean_text(ex[text_field]) for ex in tqdm(rows)]
+    return [t for t in texts if t]  # drop rows that clean down to empty strings
+
+
 def prepare_decoder_stream(args):
-    """One long corpus -> chunked into fixed-length blocks for next-token prediction."""
+    """One long corpus -> chunked into fixed-length blocks for next-token prediction.
+
+    Source priority: --source (local file) > --dataset (Hugging Face, rows
+    concatenated together) > Tiny Shakespeare (auto-downloaded default).
+    """
     out_dir = os.path.join(args.out_root, "decoder")
 
-    source_path = args.source
-    if source_path is None:
+    source_desc = None
+    if args.source is not None:
+        print(f"Reading corpus from {args.source} ...")
+        with open(args.source, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+        lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+        source_desc = args.source
+    elif args.dataset is not None:
+        lines = _load_hf_text_rows(args.dataset, args.text_field)
+        source_desc = f"hf:{args.dataset}"
+    else:
         source_path = _download_tiny_shakespeare(os.path.join("data", "raw", "tinyshakespeare.txt"))
-
-    print(f"Reading corpus from {source_path} ...")
-    with open(source_path, "r", encoding="utf-8") as f:
-        raw_lines = f.readlines()
-
-    lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+        print(f"Reading corpus from {source_path} ...")
+        with open(source_path, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+        lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+        source_desc = source_path
 
     print(f"Training {args.tokenizer} tokenizer ...")
     tokenizer = train_tokenizer(lines, args.tokenizer, args.vocab_size)
@@ -442,7 +478,7 @@ def prepare_decoder_stream(args):
     ids = []
     for line in tqdm(lines):
         ids.extend(tokenizer.encode(line))
-        ids.append(EOS_IDX)  # keep line boundaries as a signal
+        ids.append(EOS_IDX)  # keep line/row boundaries as a signal
 
     print(f"Corpus length: {len(ids)} tokens")
 
@@ -457,6 +493,7 @@ def prepare_decoder_stream(args):
     tokenizer.save(os.path.join(out_dir, "tokenizer.json"))
     save_meta(out_dir, {
         "mode": "decoder", "unit": "stream", "tokenizer": args.tokenizer,
+        "source": source_desc,
         "pad_idx": PAD_IDX, "sos_idx": SOS_IDX, "eos_idx": EOS_IDX,
         "unk_idx": UNK_IDX, "mask_idx": MASK_IDX,
         "vocab_size": len(tokenizer),
@@ -466,30 +503,43 @@ def prepare_decoder_stream(args):
 
 
 def prepare_decoder_lines(args):
-    """One example per line (names, poems, jokes, ...) -> independently padded sequences."""
-    if args.source is None:
-        raise ValueError("--unit lines requires --source path/to/file.txt (one example per line)")
+    """One example per line (names, poems, jokes, ...) -> independently padded
+    sequences. Source priority: --source (local .txt, one example per line) >
+    --dataset (Hugging Face, one row per example, `--text-field` selects the
+    column). Either way, rows are dropped unless their encoded length falls in
+    [1, --max-len] (checked below), mirroring how the other modes filter by
+    length.
+    """
+    if args.source is None and args.dataset is None:
+        raise ValueError(
+            "--unit lines requires either --source path/to/file.txt (one example per line) "
+            "or --dataset <hf_dataset_name> (with --text-field, default 'text')"
+        )
 
     out_dir = os.path.join(args.out_root, "decoder")
 
-    print(f"Reading lines from {args.source} ...")
-    with open(args.source, "r", encoding="utf-8") as f:
-        raw_lines = [l for l in f.read().splitlines() if l.strip()]
-
-    lines = [clean_text(line) for line in raw_lines]
+    if args.source is not None:
+        print(f"Reading lines from {args.source} ...")
+        with open(args.source, "r", encoding="utf-8") as f:
+            raw_lines = [l for l in f.read().splitlines() if l.strip()]
+        lines = [clean_text(line) for line in raw_lines]
+        source_desc = args.source
+    else:
+        lines = _load_hf_text_rows(args.dataset, args.text_field)
+        source_desc = f"hf:{args.dataset}"
 
     print(f"Training {args.tokenizer} tokenizer ...")
     tokenizer = train_tokenizer(lines, args.tokenizer, args.vocab_size)
     print(f"vocab size: {len(tokenizer)}")
 
-    print("Encoding + filtering by length ...")
+    print(f"Encoding + filtering by length (max_len={args.max_len}) ...")
     data = []
     for line in lines:
         ids = tokenizer.encode(line)
         if 1 <= len(ids) <= args.max_len:
             data.append([SOS_IDX] + ids + [EOS_IDX])
 
-    print(f"Kept {len(data)} lines after filtering.")
+    print(f"Kept {len(data)} / {len(lines)} rows after length filtering.")
 
     train, val, test = split_train_val_test(data)
     print(f"train={len(train)}  val={len(val)}  test={len(test)}")
@@ -498,6 +548,7 @@ def prepare_decoder_lines(args):
     tokenizer.save(os.path.join(out_dir, "tokenizer.json"))
     save_meta(out_dir, {
         "mode": "decoder", "unit": "lines", "tokenizer": args.tokenizer,
+        "source": source_desc,
         "pad_idx": PAD_IDX, "sos_idx": SOS_IDX, "eos_idx": EOS_IDX,
         "unk_idx": UNK_IDX, "mask_idx": MASK_IDX,
         "vocab_size": len(tokenizer),
@@ -773,7 +824,11 @@ def build_arg_parser():
     p.add_argument("--unit", default="stream", choices=["stream", "lines"],
                    help="only used when --mode decoder")
     p.add_argument("--out-root", default="data")
-    p.add_argument("--max-len", type=int, default=100, dest="max_len")
+    p.add_argument("--max-len", type=int, default=100, dest="max_len",
+                   help="max encoded length per row/example - used to filter rows for "
+                        "encdec, encoder (classify/regression), and decoder/lines "
+                        "(including decoder/lines when sourced from --dataset). Not used "
+                        "by decoder/stream or encoder/mlm, which chunk by --block-size instead.")
     p.add_argument("--block-size", type=int, default=64, dest="block_size",
                    help="sequence length for decoder/stream and encoder/mlm chunking")
 
@@ -785,7 +840,9 @@ def build_arg_parser():
 
     # encdec-specific
     p.add_argument("--dataset", default=None,
-                   help="HF dataset name (defaults depend on mode/task)")
+                   help="HF dataset name (defaults depend on mode/task). For --mode decoder, "
+                        "there is no default - pass this to pull the corpus from Hugging Face "
+                        "instead of a local file/URL.")
     p.add_argument("--lang-pair", default="en-fr", dest="lang_pair")
     p.add_argument("--src-lang", default="en", dest="src_lang")
     p.add_argument("--tgt-lang", default="fr", dest="tgt_lang")
@@ -801,9 +858,9 @@ def build_arg_parser():
 
     # decoder/lines and mlm/stream source override, also encoder/regression's local data
     p.add_argument("--source", default=None,
-                   help="local text file path (decoder/lines), corpus override "
-                        "(decoder/stream, encoder/mlm), or a local TSV of 'text<TAB>label' "
-                        "lines (encoder/regression) - overrides --dataset")
+                   help="local text file path (decoder/lines, decoder/stream), corpus "
+                        "override (decoder/stream, encoder/mlm), or a local TSV of "
+                        "'text<TAB>label' lines (encoder/regression) - overrides --dataset")
     p.add_argument("--val-source", default=None, dest="val_source",
                    help="encoder regression only: local TSV of 'text<TAB>label' lines for a "
                         "pre-defined validation split; if omitted, val is carved out of the "
@@ -814,8 +871,10 @@ def build_arg_parser():
                         "own test split (if --source wasn't used and one exists), then to a "
                         "carve-out from the training data")
 
-    # encoder/classify and encoder/regression-specific
-    p.add_argument("--text-field", default="text", dest="text_field")
+    # encoder/classify, encoder/regression, and decoder (when sourced from --dataset)
+    p.add_argument("--text-field", default="text", dest="text_field",
+                   help="HF dataset column holding the text - used by encoder/classify, "
+                        "encoder/regression, and decoder/{stream,lines} when --dataset is given")
     p.add_argument("--label-field", default="label", dest="label_field",
                    help="classify: class label field. regression: numeric target field "
                         "(cast to float, e.g. a rating or score)")
