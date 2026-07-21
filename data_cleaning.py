@@ -127,6 +127,42 @@ def clean_text(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Row-limiting helpers - let you cap how many rows get pulled in before the
+# (often slow) cleaning/tokenizing steps, via --data-rows. Subsampling is
+# random (seeded off the global random.seed(42) above) rather than a plain
+# head-slice, since many datasets are sorted (e.g. by label) and a head-slice
+# would silently bias what you keep.
+# --------------------------------------------------------------------------- #
+def limit_rows(items, n, desc="rows"):
+    """Randomly subsample a plain list down to at most `n` entries. No-op if
+    n is None or the list already has <= n entries."""
+    if n is None or len(items) <= n:
+        return items
+    print(f"Subsampling {desc}: {len(items)} -> {n}")
+    return random.sample(items, n)
+
+
+def limit_paired_rows(n, *lists, desc="rows"):
+    """Same as limit_rows, but applied jointly across several equal-length
+    lists (e.g. src_texts/tgt_texts, or texts/labels) so pairing is preserved."""
+    length = len(lists[0])
+    if n is None or length <= n:
+        return lists
+    print(f"Subsampling {desc}: {length} -> {n}")
+    idx = random.sample(range(length), n)
+    return tuple([lst[i] for i in idx] for lst in lists)
+
+
+def limit_hf_dataset(ds, n, desc="rows"):
+    """Same idea for a Hugging Face Dataset object - shuffle + select is the
+    efficient way to subsample before mapping/cleaning over every row."""
+    if n is None or len(ds) <= n:
+        return ds
+    print(f"Subsampling {desc}: {len(ds)} -> {n}")
+    return ds.shuffle(seed=42).select(range(n))
+
+
+# --------------------------------------------------------------------------- #
 # Character-level tokenizer: every character is its own token. No training
 # step beyond scanning the corpus once for the set of characters that appear.
 # --------------------------------------------------------------------------- #
@@ -290,6 +326,7 @@ def prepare_encdec(args):
                 f"--src-file has {len(src_lines)} lines but --tgt-file has {len(tgt_lines)} - "
                 "they must be aligned line-by-line (line N of one is the translation of line N of the other)."
             )
+        src_lines, tgt_lines = limit_paired_rows(args.data_rows, src_lines, tgt_lines, desc="sentence pairs")
         src_texts = [clean_text(l) for l in src_lines]
         tgt_texts = [clean_text(l) for l in tgt_lines]
 
@@ -307,10 +344,12 @@ def prepare_encdec(args):
                 src, tgt = parts
                 src_texts.append(clean_text(src))
                 tgt_texts.append(clean_text(tgt))
+        src_texts, tgt_texts = limit_paired_rows(args.data_rows, src_texts, tgt_texts, desc="sentence pairs")
 
     else:
         print(f"Loading {args.dataset} ({args.lang_pair}) from Hugging Face ...")
         raw = load_dataset(args.dataset, args.lang_pair)["train"]
+        raw = limit_hf_dataset(raw, args.data_rows, desc="sentence pairs")
         print("Cleaning text ...")
         src_texts, tgt_texts = [], []
         for example in tqdm(raw):
@@ -369,7 +408,7 @@ def _download_tiny_shakespeare(dest_path):
     return dest_path
 
 
-def _load_hf_text_rows(dataset_name, text_field, split="train"):
+def _load_hf_text_rows(dataset_name, text_field, split="train", max_rows=None):
     """Load a Hugging Face dataset and pull out one cleaned string per row
     from `text_field`. Shared by decoder/stream and decoder/lines so both
     can source their corpus from the Hub instead of (or in addition to) a
@@ -381,6 +420,7 @@ def _load_hf_text_rows(dataset_name, text_field, split="train"):
             f"Split '{split}' not found in {dataset_name} - available splits: {list(raw.keys())}"
         )
     rows = raw[split]
+    rows = limit_hf_dataset(rows, max_rows, desc="rows")
     print("Cleaning text ...")
     texts = [clean_text(ex[text_field]) for ex in tqdm(rows)]
     return [t for t in texts if t]  # drop rows that clean down to empty strings
@@ -400,9 +440,10 @@ def prepare_decoder_stream(args):
         with open(args.source, "r", encoding="utf-8") as f:
             raw_lines = f.readlines()
         lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+        lines = limit_rows(lines, args.data_rows, desc="lines")
         source_desc = args.source
     elif args.dataset is not None:
-        lines = _load_hf_text_rows(args.dataset, args.text_field)
+        lines = _load_hf_text_rows(args.dataset, args.text_field, max_rows=args.data_rows)
         source_desc = f"hf:{args.dataset}"
     else:
         source_path = _download_tiny_shakespeare(os.path.join("data", "raw", "tinyshakespeare.txt"))
@@ -410,6 +451,7 @@ def prepare_decoder_stream(args):
         with open(source_path, "r", encoding="utf-8") as f:
             raw_lines = f.readlines()
         lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+        lines = limit_rows(lines, args.data_rows, desc="lines")
         source_desc = source_path
 
     print(f"Building {args.tokenizer} tokenizer ...")
@@ -465,9 +507,10 @@ def prepare_decoder_lines(args):
         with open(args.source, "r", encoding="utf-8") as f:
             raw_lines = [l for l in f.read().splitlines() if l.strip()]
         lines = [clean_text(line) for line in raw_lines]
+        lines = limit_rows(lines, args.data_rows, desc="lines")
         source_desc = args.source
     else:
-        lines = _load_hf_text_rows(args.dataset, args.text_field)
+        lines = _load_hf_text_rows(args.dataset, args.text_field, max_rows=args.data_rows)
         source_desc = f"hf:{args.dataset}"
 
     print(f"Building {args.tokenizer} tokenizer ...")
@@ -509,6 +552,10 @@ def prepare_encoder_classify(args):
     raw = load_dataset(args.dataset)
     train_raw = raw["train"]
     test_raw = raw["test"] if "test" in raw else None
+
+    train_raw = limit_hf_dataset(train_raw, args.data_rows, desc="train rows")
+    if test_raw is not None:
+        test_raw = limit_hf_dataset(test_raw, args.data_rows, desc="test rows")
 
     text_field = args.text_field
     label_field = args.label_field
@@ -623,14 +670,22 @@ def prepare_encoder_regression(args):
     if args.source:
         print(f"Loading local training TSV: {args.source} ...")
         train_texts, train_targets_raw = load_regression_tsv(args.source)
+        train_texts, train_targets_raw = limit_paired_rows(
+            args.data_rows, train_texts, train_targets_raw, desc="train rows")
         if args.test_source:
             print(f"Loading local test TSV: {args.test_source} ...")
             test_texts, test_targets_raw = load_regression_tsv(args.test_source)
+            test_texts, test_targets_raw = limit_paired_rows(
+                args.data_rows, test_texts, test_targets_raw, desc="test rows")
     else:
         print(f"Loading {args.dataset} from Hugging Face ...")
         raw = load_dataset(args.dataset)
         train_raw = raw["train"]
         hf_test_raw = raw["test"] if "test" in raw else None
+
+        train_raw = limit_hf_dataset(train_raw, args.data_rows, desc="train rows")
+        if hf_test_raw is not None:
+            hf_test_raw = limit_hf_dataset(hf_test_raw, args.data_rows, desc="test rows")
 
         text_field = args.text_field
         label_field = args.label_field
@@ -685,6 +740,8 @@ def prepare_encoder_regression(args):
     if args.val_source:
         print(f"Loading local val TSV: {args.val_source} ...")
         val_texts, val_targets_raw = load_regression_tsv(args.val_source)
+        val_texts, val_targets_raw = limit_paired_rows(
+            args.data_rows, val_texts, val_targets_raw, desc="val rows")
         val = encode_and_filter(val_texts, val_targets_raw)
 
     if test_texts is not None:
@@ -725,6 +782,7 @@ def prepare_encoder_mlm(args):
         raw_lines = f.readlines()
 
     lines = [clean_text(line) for line in raw_lines if clean_text(line)]
+    lines = limit_rows(lines, args.data_rows, desc="lines")
 
     print(f"Building {args.tokenizer} tokenizer ...")
     tokenizer = train_tokenizer(lines, args.tokenizer, args.tiktoken_encoding)
@@ -773,6 +831,15 @@ def build_arg_parser():
                         "by decoder/stream or encoder/mlm, which chunk by --block-size instead.")
     p.add_argument("--block-size", type=int, default=64, dest="block_size",
                    help="sequence length for decoder/stream and encoder/mlm chunking")
+    p.add_argument("--data-rows", type=int, default=None, dest="data_rows",
+                   help="cap on how many rows to pull in before cleaning/tokenizing, e.g. "
+                        "--data-rows 100000 to avoid pulling in all 2M+ rows of a big HF "
+                        "dataset. Applies per split (train/val/test each capped separately) "
+                        "and, for encdec/regression, jointly across paired lists (src/tgt, "
+                        "text/label) so pairing stays intact. Subsampling is random (seeded) "
+                        "rather than just taking the first N rows, since many datasets are "
+                        "sorted (e.g. by label) and a head-slice would bias what you keep. "
+                        "Default: None (use everything).")
 
     p.add_argument("--tokenizer", default="tiktoken", choices=["tiktoken", "char"],
                    help="tiktoken (default): use a pretrained OpenAI tiktoken encoding "
