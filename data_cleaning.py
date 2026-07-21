@@ -30,6 +30,10 @@ Three modes, matching train.py's three modes:
       e.g. predicting a star rating from review text.
       Default source: HF `yelp_review_full` (text -> 0-4 star rating, used
       here as a numeric regression target rather than a class label).
+      Alternatively, pass --source (and optionally --val-source/--test-source)
+      pointing at local TSV files of 'text<TAB>label' lines - the format a
+      dataset-specific prep script (e.g. build_fluorescence_dataset.py) writes,
+      once it has flattened that dataset's own fields into a single text string.
       Targets are standardized (zero mean, unit std, computed on the train
       split only) before saving; the mean/std are stored in meta.json so
       train.py/inference.py can convert predictions back to the original scale.
@@ -596,29 +600,63 @@ def prepare_encoder_classify(args):
 # --------------------------------------------------------------------------- #
 # Mode 3c: encoder-only, regression
 # --------------------------------------------------------------------------- #
+def load_regression_tsv(path):
+    """Local file format for encoder/regression: one 'text<TAB>label' example per line.
+    This is what a dataset-specific prep script (e.g. build_fluorescence_dataset.py)
+    writes out - this function only knows about generic text/label pairs, not any
+    particular dataset's own column names, which is exactly why that flattening step
+    has to happen upstream, in the prep script."""
+    texts, targets = [], []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                print(f"  (skipping malformed line {line_num} in {path}: expected 1 tab, got {len(parts) - 1})")
+                continue
+            text, label = parts
+            texts.append(clean_text(text))
+            targets.append(float(label))
+    return texts, targets
+
+
 def prepare_encoder_regression(args):
     out_dir = os.path.join(args.out_root, "encoder_regression")
 
-    print(f"Loading {args.dataset} from Hugging Face ...")
-    raw = load_dataset(args.dataset)
-    train_raw = raw["train"]
-    test_raw = raw["test"] if "test" in raw else None
+    test_texts, test_targets_raw = None, None  # populated below if a test split is available
 
-    text_field = args.text_field
-    label_field = args.label_field
+    if args.source:
+        print(f"Loading local training TSV: {args.source} ...")
+        train_texts, train_targets_raw = load_regression_tsv(args.source)
+        if args.test_source:
+            print(f"Loading local test TSV: {args.test_source} ...")
+            test_texts, test_targets_raw = load_regression_tsv(args.test_source)
+    else:
+        print(f"Loading {args.dataset} from Hugging Face ...")
+        raw = load_dataset(args.dataset)
+        train_raw = raw["train"]
+        hf_test_raw = raw["test"] if "test" in raw else None
 
-    def clean_split(split):
-        texts, targets = [], []
-        for ex in tqdm(split):
-            texts.append(clean_text(ex[text_field]))
-            # Cast straight to float - works whether label_field is already a float
-            # score (e.g. a similarity score) or an int class id being repurposed as
-            # a numeric target (e.g. yelp_review_full's 0-4 star rating).
-            targets.append(float(ex[label_field]))
-        return texts, targets
+        text_field = args.text_field
+        label_field = args.label_field
 
-    print("Cleaning train split ...")
-    train_texts, train_targets_raw = clean_split(train_raw)
+        def clean_split(split):
+            texts, targets = [], []
+            for ex in tqdm(split):
+                texts.append(clean_text(ex[text_field]))
+                # Cast straight to float - works whether label_field is already a float
+                # score (e.g. a similarity score) or an int class id being repurposed as
+                # a numeric target (e.g. yelp_review_full's 0-4 star rating).
+                targets.append(float(ex[label_field]))
+            return texts, targets
+
+        print("Cleaning train split ...")
+        train_texts, train_targets_raw = clean_split(train_raw)
+        if hf_test_raw is not None:
+            print("Cleaning + encoding test split ...")
+            test_texts, test_targets_raw = clean_split(hf_test_raw)
 
     # Standardize targets (zero mean, unit std) using train-split statistics only,
     # to avoid leaking val/test information into the normalization. This is the
@@ -648,9 +686,15 @@ def prepare_encoder_regression(args):
     data = encode_and_filter(train_texts, train_targets_raw)
     train, val, test_from_train = split_train_val_test(data)
 
-    if test_raw is not None:
-        print("Cleaning + encoding test split ...")
-        test_texts, test_targets_raw = clean_split(test_raw)
+    # A pre-defined val split (e.g. --val-source) overrides the carve-out above -
+    # useful whenever the source dataset's own split matters (like fluorescence's
+    # extrapolation-style train/valid/test, rather than an i.i.d. random split).
+    if args.val_source:
+        print(f"Loading local val TSV: {args.val_source} ...")
+        val_texts, val_targets_raw = load_regression_tsv(args.val_source)
+        val = encode_and_filter(val_texts, val_targets_raw)
+
+    if test_texts is not None:
         test = encode_and_filter(test_texts, test_targets_raw)
     else:
         test = test_from_train
@@ -755,9 +799,20 @@ def build_arg_parser():
                    help="encdec: single local TSV file, each line 'source<TAB>target' - "
                         "alternative to --src-file/--tgt-file")
 
-    # decoder/lines and mlm/stream source override
+    # decoder/lines and mlm/stream source override, also encoder/regression's local data
     p.add_argument("--source", default=None,
-                   help="local text file path (decoder/lines) or corpus override (decoder/stream, encoder/mlm)")
+                   help="local text file path (decoder/lines), corpus override "
+                        "(decoder/stream, encoder/mlm), or a local TSV of 'text<TAB>label' "
+                        "lines (encoder/regression) - overrides --dataset")
+    p.add_argument("--val-source", default=None, dest="val_source",
+                   help="encoder regression only: local TSV of 'text<TAB>label' lines for a "
+                        "pre-defined validation split; if omitted, val is carved out of the "
+                        "training data the normal way")
+    p.add_argument("--test-source", default=None, dest="test_source",
+                   help="encoder regression only: local TSV of 'text<TAB>label' lines for a "
+                        "pre-defined test split; if omitted, falls back to the HF dataset's "
+                        "own test split (if --source wasn't used and one exists), then to a "
+                        "carve-out from the training data")
 
     # encoder/classify and encoder/regression-specific
     p.add_argument("--text-field", default="text", dest="text_field")
@@ -788,7 +843,7 @@ def main():
                 args.dataset = "fancyzhx/ag_news"
             prepare_encoder_classify(args)
         elif args.task == "regression":
-            if args.dataset is None:
+            if args.dataset is None and args.source is None:
                 args.dataset = "yelp_review_full"
             prepare_encoder_regression(args)
         else:
