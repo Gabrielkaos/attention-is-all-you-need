@@ -291,6 +291,78 @@ class NoamScheduler:
         return lr
 
 
+# --------------------------------------------------------------------------- #
+# Within-epoch progress reporting
+# --------------------------------------------------------------------------- #
+class ProgressTracker:
+    """Prints a single, live-updating progress line *during* an epoch (step count,
+    metrics, throughput, ETA for the rest of the epoch) instead of the old
+    behavior where stdout stayed silent until the whole epoch had finished.
+
+    Printing is throttled to once every `min_interval` seconds (default 2s) rather
+    than every batch, for two reasons: it keeps a fast GPU from flooding the
+    terminal with thousands of lines, and it means any tensor metrics you pass in
+    (e.g. a running loss) are only pulled to the CPU with .item() - which forces a
+    GPU sync - at those throttled print times, not on every single step. That's a
+    much lower sync frequency than "once per batch" while still being far more
+    responsive than "once per epoch".
+
+    Usage:
+        progress = ProgressTracker(len(loader), epoch, "decoder/train") if is_main_process() else None
+        for batch in loader:
+            ...
+            if progress is not None:
+                progress.update(loss=running_loss_tensor, lr=current_lr)
+        if progress is not None:
+            progress.finish()
+    """
+    def __init__(self, total_steps, epoch, label, min_interval=2.0):
+        self.total_steps = max(total_steps, 1)
+        self.epoch = epoch
+        self.label = label
+        self.min_interval = min_interval
+        self.start_time = time.time()
+        self.last_print_time = 0.0  # 0 forces the very first step to print right away
+        self.step = 0
+
+    def update(self, **metrics):
+        self.step += 1
+        now = time.time()
+        is_last_step = self.step >= self.total_steps
+        if (now - self.last_print_time) < self.min_interval and not is_last_step:
+            return  # not time to print yet - just keep accumulating
+        self.last_print_time = now
+
+        elapsed = now - self.start_time
+        rate = self.step / elapsed if elapsed > 0 else 0.0
+        eta_seconds = (self.total_steps - self.step) / rate if rate > 0 else 0.0
+        pct = 100 * self.step / self.total_steps
+
+        parts = []
+        for name, value in metrics.items():
+            value = value.item() if torch.is_tensor(value) else value
+            parts.append(f"{name} {value:.4f}")
+        metrics_str = (" | " + " | ".join(parts)) if parts else ""
+
+        line = (f"[{self.label}] epoch {self.epoch:02d} | step {self.step}/{self.total_steps} "
+                f"({pct:5.1f}%){metrics_str} | elapsed {self._fmt(elapsed)} | "
+                f"eta {self._fmt(eta_seconds)}   ")
+        # \r overwrites the previous progress line in place instead of scrolling
+        print(f"\r{line}", end="", flush=True)
+
+    def finish(self):
+        # move to a fresh line so whatever prints next (e.g. the epoch summary)
+        # doesn't get appended to the end of the progress line
+        print()
+
+    @staticmethod
+    def _fmt(seconds):
+        seconds = max(seconds, 0)
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
 def save_checkpoint(ckpt_dir, name, model, optimizer, scheduler, config, epoch, metric):
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save({
@@ -400,6 +472,7 @@ def train_encdec(args):
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_tokens_sum = torch.zeros((), device=DEVICE)
+        progress = ProgressTracker(len(train_loader), epoch, "encdec/train", min_interval=args.progress_interval) if is_main_process() else None
         for src, tgt in train_loader:
             src = src.to(DEVICE, non_blocking=True)
             tgt = tgt.to(DEVICE, non_blocking=True)
@@ -409,14 +482,19 @@ def train_encdec(args):
                 logits = model(src, tgt_in)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
-            scheduler.step()
+            lr = scheduler.step()
             backward_step(loss, model, optimizer, scaler, args.grad_clip)
 
-            # accumulate on-device and only sync to CPU once, after the epoch -
-            # a per-batch .item() here would force a GPU sync every single step
+            # accumulate on-device; only synced to CPU at throttled progress prints
+            # (see ProgressTracker) and once more at the end of the epoch below -
+            # never on every single step
             n_tok = (tgt_out != pad_idx).sum()
             train_loss_sum += loss.detach() * n_tok
             train_tokens_sum += n_tok
+            if progress is not None:
+                progress.update(loss=train_loss_sum / train_tokens_sum.clamp(min=1), lr=lr)
+        if progress is not None:
+            progress.finish()
         reduce_sum(train_loss_sum)
         reduce_sum(train_tokens_sum)
         train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
@@ -424,6 +502,7 @@ def train_encdec(args):
         model.eval()
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_tokens_sum = torch.zeros((), device=DEVICE)
+        val_progress = ProgressTracker(len(val_loader), epoch, "encdec/val", min_interval=args.progress_interval) if is_main_process() else None
         with torch.no_grad():
             for src, tgt in val_loader:
                 src = src.to(DEVICE, non_blocking=True)
@@ -435,6 +514,10 @@ def train_encdec(args):
                 n_tok = (tgt_out != pad_idx).sum()
                 val_loss_sum += loss.detach() * n_tok
                 val_tokens_sum += n_tok
+                if val_progress is not None:
+                    val_progress.update(loss=val_loss_sum / val_tokens_sum.clamp(min=1))
+        if val_progress is not None:
+            val_progress.finish()
         reduce_sum(val_loss_sum)
         reduce_sum(val_tokens_sum)
         val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
@@ -534,6 +617,7 @@ def train_decoder(args):
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_tokens_sum = torch.zeros((), device=DEVICE)
+        progress = ProgressTracker(len(train_loader), epoch, "decoder/train", min_interval=args.progress_interval) if is_main_process() else None
         for batch in train_loader:
             batch = batch.to(DEVICE, non_blocking=True)
             x, y = batch[:, :-1], batch[:, 1:]  # next-token prediction
@@ -542,12 +626,16 @@ def train_decoder(args):
                 logits = model(x)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
-            scheduler.step()
+            lr = scheduler.step()
             backward_step(loss, model, optimizer, scaler, args.grad_clip)
 
             n_tok = (y != pad_idx).sum()
             train_loss_sum += loss.detach() * n_tok
             train_tokens_sum += n_tok
+            if progress is not None:
+                progress.update(loss=train_loss_sum / train_tokens_sum.clamp(min=1), lr=lr)
+        if progress is not None:
+            progress.finish()
         reduce_sum(train_loss_sum)
         reduce_sum(train_tokens_sum)
         train_loss = (train_loss_sum / train_tokens_sum.clamp(min=1)).item()
@@ -555,6 +643,7 @@ def train_decoder(args):
         model.eval()
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_tokens_sum = torch.zeros((), device=DEVICE)
+        val_progress = ProgressTracker(len(val_loader), epoch, "decoder/val", min_interval=args.progress_interval) if is_main_process() else None
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(DEVICE, non_blocking=True)
@@ -565,6 +654,10 @@ def train_decoder(args):
                 n_tok = (y != pad_idx).sum()
                 val_loss_sum += loss.detach() * n_tok
                 val_tokens_sum += n_tok
+                if val_progress is not None:
+                    val_progress.update(loss=val_loss_sum / val_tokens_sum.clamp(min=1))
+        if val_progress is not None:
+            val_progress.finish()
         reduce_sum(val_loss_sum)
         reduce_sum(val_tokens_sum)
         val_loss = (val_loss_sum / val_tokens_sum.clamp(min=1)).item()
@@ -680,6 +773,7 @@ def train_encoder_classify(args):
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_correct_sum = torch.zeros((), device=DEVICE)
         train_total_sum = torch.zeros((), device=DEVICE)
+        progress = ProgressTracker(len(train_loader), epoch, "encoder_classify/train", min_interval=args.progress_interval) if is_main_process() else None
         for tokens, labels in train_loader:
             tokens = tokens.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
@@ -694,6 +788,11 @@ def train_encoder_classify(args):
             train_loss_sum += loss.detach() * bs
             train_correct_sum += (logits.argmax(-1) == labels).sum()
             train_total_sum += bs
+            if progress is not None:
+                progress.update(loss=train_loss_sum / train_total_sum.clamp(min=1),
+                                 acc=train_correct_sum / train_total_sum.clamp(min=1))
+        if progress is not None:
+            progress.finish()
         reduce_sum(train_loss_sum)
         reduce_sum(train_correct_sum)
         reduce_sum(train_total_sum)
@@ -704,6 +803,7 @@ def train_encoder_classify(args):
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_correct_sum = torch.zeros((), device=DEVICE)
         val_total_sum = torch.zeros((), device=DEVICE)
+        val_progress = ProgressTracker(len(val_loader), epoch, "encoder_classify/val", min_interval=args.progress_interval) if is_main_process() else None
         with torch.no_grad():
             for tokens, labels in val_loader:
                 tokens = tokens.to(DEVICE, non_blocking=True)
@@ -715,6 +815,11 @@ def train_encoder_classify(args):
                 val_loss_sum += loss.detach() * bs
                 val_correct_sum += (logits.argmax(-1) == labels).sum()
                 val_total_sum += bs
+                if val_progress is not None:
+                    val_progress.update(loss=val_loss_sum / val_total_sum.clamp(min=1),
+                                         acc=val_correct_sum / val_total_sum.clamp(min=1))
+        if val_progress is not None:
+            val_progress.finish()
         reduce_sum(val_loss_sum)
         reduce_sum(val_correct_sum)
         reduce_sum(val_total_sum)
@@ -824,6 +929,7 @@ def train_encoder_regression(args):
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_abs_err_sum = torch.zeros((), device=DEVICE)
         train_total_sum = torch.zeros((), device=DEVICE)
+        progress = ProgressTracker(len(train_loader), epoch, "encoder_regression/train", min_interval=args.progress_interval) if is_main_process() else None
         for tokens, targets in train_loader:
             tokens = tokens.to(DEVICE, non_blocking=True)
             targets = targets.to(DEVICE, non_blocking=True)
@@ -838,6 +944,11 @@ def train_encoder_regression(args):
             train_loss_sum += loss.detach() * bs
             train_abs_err_sum += (preds.detach() - targets).abs().sum()
             train_total_sum += bs
+            if progress is not None:
+                progress.update(mse=train_loss_sum / train_total_sum.clamp(min=1),
+                                 mae=train_abs_err_sum / train_total_sum.clamp(min=1))
+        if progress is not None:
+            progress.finish()
         reduce_sum(train_loss_sum)
         reduce_sum(train_abs_err_sum)
         reduce_sum(train_total_sum)
@@ -848,6 +959,7 @@ def train_encoder_regression(args):
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_abs_err_sum = torch.zeros((), device=DEVICE)
         val_total_sum = torch.zeros((), device=DEVICE)
+        val_progress = ProgressTracker(len(val_loader), epoch, "encoder_regression/val", min_interval=args.progress_interval) if is_main_process() else None
         with torch.no_grad():
             for tokens, targets in val_loader:
                 tokens = tokens.to(DEVICE, non_blocking=True)
@@ -859,6 +971,11 @@ def train_encoder_regression(args):
                 val_loss_sum += loss.detach() * bs
                 val_abs_err_sum += (preds.detach() - targets).abs().sum()
                 val_total_sum += bs
+                if val_progress is not None:
+                    val_progress.update(mse=val_loss_sum / val_total_sum.clamp(min=1),
+                                         mae=val_abs_err_sum / val_total_sum.clamp(min=1))
+        if val_progress is not None:
+            val_progress.finish()
         reduce_sum(val_loss_sum)
         reduce_sum(val_abs_err_sum)
         reduce_sum(val_total_sum)
@@ -988,6 +1105,7 @@ def train_encoder_mlm(args):
         model.train()
         train_loss_sum = torch.zeros((), device=DEVICE)
         train_masked_sum = torch.zeros((), device=DEVICE)
+        progress = ProgressTracker(len(train_loader), epoch, "encoder_mlm/train", min_interval=args.progress_interval) if is_main_process() else None
         for batch in train_loader:
             batch = batch.to(DEVICE, non_blocking=True)
             inputs, labels = mask_tokens(batch, mask_idx, meta["vocab_size"], pad_idx)
@@ -996,13 +1114,17 @@ def train_encoder_mlm(args):
                 logits = model(inputs, task="mlm")
                 loss = criterion(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
-            scheduler.step()
+            lr = scheduler.step()
             backward_step(loss, model, optimizer, scaler, args.grad_clip)
-            
+
 
             n_masked = (labels != -100).sum()
             train_loss_sum += loss.detach() * n_masked
             train_masked_sum += n_masked
+            if progress is not None:
+                progress.update(loss=train_loss_sum / train_masked_sum.clamp(min=1), lr=lr)
+        if progress is not None:
+            progress.finish()
         reduce_sum(train_loss_sum)
         reduce_sum(train_masked_sum)
         train_loss = (train_loss_sum / train_masked_sum.clamp(min=1)).item()
@@ -1010,6 +1132,7 @@ def train_encoder_mlm(args):
         model.eval()
         val_loss_sum = torch.zeros((), device=DEVICE)
         val_masked_sum = torch.zeros((), device=DEVICE)
+        val_progress = ProgressTracker(len(val_loader), epoch, "encoder_mlm/val", min_interval=args.progress_interval) if is_main_process() else None
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(DEVICE, non_blocking=True)
@@ -1020,6 +1143,10 @@ def train_encoder_mlm(args):
                 n_masked = (labels != -100).sum()
                 val_loss_sum += loss.detach() * n_masked
                 val_masked_sum += n_masked
+                if val_progress is not None:
+                    val_progress.update(loss=val_loss_sum / val_masked_sum.clamp(min=1))
+        if val_progress is not None:
+            val_progress.finish()
         reduce_sum(val_loss_sum)
         reduce_sum(val_masked_sum)
         val_loss = (val_loss_sum / val_masked_sum.clamp(min=1)).item()
@@ -1091,6 +1218,9 @@ def build_arg_parser():
                    help="flat AdamW learning rate, only used when --mode encoder --task classify/regression")
     p.add_argument("--weight-decay", type=float, default=0.01, dest="weight_decay",
                    help="AdamW weight decay, only used when --mode encoder --task classify/regression")
+    p.add_argument("--progress-interval", type=float, default=2.0, dest="progress_interval",
+                   help="minimum seconds between within-epoch progress line updates (default 2.0). "
+                        "Lower it for more frequent updates, raise it to print less often.")
 
     return p
 
