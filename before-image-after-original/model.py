@@ -48,29 +48,6 @@ What changed from the original paper and why:
 No external attention/transformer libraries are used - everything is still
 plain torch.nn (plus the one call into F.scaled_dot_product_attention) so you
 can see exactly what every piece does.
-
-Optional vision support (added on top of the above, everything below is
-opt-in and off by default):
-  - A ViT-style VisionEncoder (Dosovitskiy et al., 2021) turns an image into
-    a sequence of patch embeddings, reusing EncoderLayer directly - a pre-LN
-    self-attention + gated-FFN block is architecture-agnostic, so the same
-    class that already implements a text encoder layer implements a ViT
-    layer too (called with rope=None instead of RoPE, since a 2-D patch
-    grid has no single natural 1-D position ordering - see VisionEncoder's
-    docstring).
-  - A small VisionLanguageProjector (2-layer MLP, the LLaVA-1.5 recipe) maps
-    those patch embeddings into the text model's d_model, so they become
-    ordinary-looking "tokens" that get concatenated onto the front of a text
-    embedding sequence and fed through the *same* attention layers as text -
-    no new attention mechanism, no change to RoPE/GQA/KV-cache/masking.
-    This is shallow ("LLaVA-style") fusion rather than deep cross-attention
-    fusion (Flamingo-style) - simpler to read, and standard at this scale.
-  - Every one of the four task heads below (Transformer, TransformerDecoderOnly,
-    TransformerEncoderOnly, TransformerRegression) accepts an optional
-    vision_config at construction and an optional image=... at call time.
-    Leaving vision_config=None (the default) reproduces the exact same
-    model - same parameters, same forward behavior - as before this was
-    added, so existing checkpoints and training scripts are unaffected.
 """
 
 import torch
@@ -302,190 +279,6 @@ class EncoderLayer(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# --------------------------- VISION (optional) ------------------------------
-# --------------------------------------------------------------------------- #
-# Everything in this section is only used when a model is constructed with
-# vision_config != None. It turns an image into a sequence of vectors shaped
-# just like text token embeddings, so the text side of every architecture
-# below can stay almost entirely unchanged - it just sees a (possibly
-# longer) sequence of d_model-shaped vectors, some of which happen to have
-# come from a picture instead of an embedding-table lookup.
-# --------------------------------------------------------------------------- #
-
-# --------------------------------------------------------------------------- #
-# Splits an image into fixed-size non-overlapping patches and linearly
-# projects each one into d_model - ViT's "an image is worth 16x16 words"
-# trick (Dosovitskiy et al., 2021). A single strided Conv2d with
-# kernel_size == stride == patch_size slices the image into patch_size x
-# patch_size squares and projects each one in a single fused op
-# (mathematically identical to: cut out each patch, flatten its pixels, then
-# nn.Linear - the conv formulation is just faster).
-# --------------------------------------------------------------------------- #
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size: int, patch_size: int, in_channels: int, d_model: int):
-        super().__init__()
-        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # pixel_values: (batch, in_channels, img_size, img_size)
-        x = self.proj(pixel_values)          # (b, d_model, img_size/p, img_size/p)
-        return x.flatten(2).transpose(1, 2)  # (b, num_patches, d_model)
-
-
-# --------------------------------------------------------------------------- #
-# ViT-style image backbone: PatchEmbedding -> [CLS] -> learned position
-# embeddings -> N x EncoderLayer (reused verbatim from the text stack) ->
-# final RMSNorm.
-#
-# Position encoding note: text blocks get position information via RoPE,
-# which rotates Q/K as a function of *1-D sequence* position. A raster-
-# scanned grid of patches has no single natural 1-D ordering the way a
-# sentence does, so instead of forcing RoPE onto it, this class falls back
-# to what the original ViT paper uses: one learned absolute position
-# embedding per patch slot, added once at the input. To reuse EncoderLayer
-# unmodified, every layer call below passes rope=None - look at
-# Attention.forward's guard "if self.use_rope and rope is not None:" - so
-# even though EncoderLayer always constructs its self_attn with
-# use_rope=True, passing rope=None at call time makes RoPE a no-op and this
-# behaves as plain (non-rotary) self-attention. That guard already existed
-# in Attention for exactly this kind of reuse.
-#
-# (Modern VLMs like Qwen2-VL instead use a 2-D RoPE variant that rotates by
-# (row, col) position - a real improvement, deliberately left out here to
-# keep this class reusing what the text side already has.)
-# --------------------------------------------------------------------------- #
-class VisionEncoder(nn.Module):
-    def __init__(
-        self,
-        img_size: int = 224,
-        patch_size: int = 16,
-        in_channels: int = 3,
-        d_model: int = 384,
-        num_layers: int = 6,
-        num_heads: int = 6,
-        d_ff: int = 1536,
-        dropout: float = 0.1,
-        use_cls_token: bool = True,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, d_model)
-        num_patches = self.patch_embed.num_patches
-        self.use_cls_token = use_cls_token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model)) if use_cls_token else None
-        num_positions = num_patches + (1 if use_cls_token else 0)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_positions, d_model))
-        self.dropout = nn.Dropout(dropout)
-
-        # Plain multi-head attention (num_kv_heads=None -> Attention's own
-        # default, num_heads == num_kv_heads). GQA exists to shrink the
-        # *KV-cache* during autoregressive decoding; a ViT runs once per
-        # image, non-autoregressively, so there's no cache to shrink and no
-        # reason to pay GQA's quality cost here.
-        self.layers = nn.ModuleList([
-            EncoderLayer(d_model, num_heads, d_ff, num_kv_heads=None, dropout=dropout)
-            for _ in range(num_layers)
-        ])
-        self.norm_f = RMSNorm(d_model)
-
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        if self.cls_token is not None:
-            nn.init.trunc_normal_(self.cls_token, std=0.02)
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        x = self.patch_embed(pixel_values)  # (b, num_patches, d_model)
-        if self.cls_token is not None:
-            cls = self.cls_token.expand(x.size(0), -1, -1)
-            x = torch.cat([cls, x], dim=1)  # (b, num_patches+1, d_model)
-        x = self.dropout(x + self.pos_embed)
-
-        # No mask: every patch (and the CLS token) is real - bidirectional
-        # attention among all of them. There's no padding concept for a
-        # fixed-resolution image and no reason to hide any patch from any
-        # other, unlike causal text decoding.
-        for layer in self.layers:
-            x = layer(x, mask=None, rope=None)
-        return self.norm_f(x)  # (b, num_patches[+1], d_model_vision)
-
-
-# --------------------------------------------------------------------------- #
-# Projects vision-encoder output into the text model's embedding space so
-# image "tokens" can be concatenated with real text token embeddings and fed
-# through the *same* attention layers as text - this is the entire
-# multimodal fusion mechanism used below; everything downstream just sees
-# more token-shaped vectors.
-#
-# A 2-layer MLP (Linear -> GELU -> Linear), not a single Linear: this is the
-# LLaVA-1.5 "MLP projector" (Liu et al., 2023), which measurably improved on
-# LLaVA-1.0's single-linear projector at negligible extra cost, and is the
-# standard choice in current small-to-mid open VLMs.
-# --------------------------------------------------------------------------- #
-class VisionLanguageProjector(nn.Module):
-    def __init__(self, d_model_vision: int, d_model_text: int):
-        super().__init__()
-        self.fc1 = nn.Linear(d_model_vision, d_model_text)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(d_model_text, d_model_text)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
-
-
-# --------------------------------------------------------------------------- #
-# Bundles a VisionEncoder + VisionLanguageProjector into the one thing every
-# task head below actually needs: "pixels in, d_model-shaped image token
-# embeddings out". Kept as a tiny separate module (rather than inlining two
-# submodules into every task head's __init__) purely so vision_config can be
-# a single plain dict shared verbatim across Transformer /
-# TransformerDecoderOnly / TransformerEncoderOnly / TransformerRegression,
-# instead of four copies of the same two-submodule wiring.
-# --------------------------------------------------------------------------- #
-class VisionModule(nn.Module):
-    def __init__(self, d_model_text: int, img_size: int = 224, patch_size: int = 16,
-                 in_channels: int = 3, d_model_vision: int = 384, num_layers: int = 6,
-                 num_heads: int = 6, d_ff: int = 1536, dropout: float = 0.1,
-                 use_cls_token: bool = True):
-        super().__init__()
-        self.encoder = VisionEncoder(img_size, patch_size, in_channels, d_model_vision,
-                                      num_layers, num_heads, d_ff, dropout, use_cls_token)
-        self.projector = VisionLanguageProjector(d_model_vision, d_model_text)
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return self.projector(self.encoder(pixel_values))  # (b, num_img_tokens, d_model_text)
-
-
-# --------------------------------------------------------------------------- #
-# Shared glue between the vision path and every text stack's existing
-# embedding-in / mask-in forward signature. Concatenates projected image
-# embeddings with text token embeddings along the sequence axis and builds
-# the matching 1-D "is this a real position" mask (before any stack's own
-# mask helper reshapes it into (b,1,1,len) or (b,1,len,len)).
-# --------------------------------------------------------------------------- #
-def build_multimodal_embeds(token_embedding: nn.Embedding, image_embeds, text_ids, pad_idx: int):
-    """
-    image_embeds: (batch, num_img_tokens, d_model) already projected into
-        d_model (e.g. by a VisionModule), or None for text-only input.
-    text_ids: (batch, text_len) token ids, or None for image-only input.
-    Returns (inputs_embeds, pad_mask_1d):
-        inputs_embeds - (batch, total_len, d_model)
-        pad_mask_1d   - (batch, total_len) bool, True = attend to this
-                        position (image patches are never "padding").
-    """
-    pieces, masks = [], []
-    if image_embeds is not None:
-        pieces.append(image_embeds)
-        b, n_img, _ = image_embeds.shape
-        masks.append(torch.ones(b, n_img, dtype=torch.bool, device=image_embeds.device))
-    if text_ids is not None:
-        pieces.append(token_embedding(text_ids))
-        masks.append(text_ids != pad_idx)
-    assert pieces, "build_multimodal_embeds needs an image, text ids, or both"
-    return torch.cat(pieces, dim=1), torch.cat(masks, dim=1)
-
-
-# --------------------------------------------------------------------------- #
 # One Decoder block (Pre-LN): RMSNorm -> Masked Self-Attn(RoPE) -> +res
 #                              -> RMSNorm -> Cross-Attn -> +res
 #                              -> RMSNorm -> SwiGLU FFN -> +res
@@ -541,20 +334,9 @@ class Encoder(nn.Module):
         )
         self.norm_f = RMSNorm(d_model)
 
-    def forward(self, src=None, src_mask=None, inputs_embeds=None):
-        """
-        Normal (text-only) call: forward(src, src_mask) - unchanged from
-        before, positional args so every existing call site keeps working.
-        Multimodal call: forward(src_mask=..., inputs_embeds=...) - skips
-        the embedding-table lookup and starts directly from precomputed
-        vectors (e.g. image patch embeddings, or an [image_embeds; text
-        token_embeds] sequence already concatenated by
-        build_multimodal_embeds) - see VisionModule / Transformer.encode.
-        """
-        if inputs_embeds is None:
-            inputs_embeds = self.embedding(src)
-        x = self.dropout(inputs_embeds)
-        rope = self.rotary_emb(x.size(1), x.device, x.dtype)
+    def forward(self, src, src_mask):
+        x = self.dropout(self.embedding(src))
+        rope = self.rotary_emb(src.size(1), x.device, x.dtype)
         for layer in self.layers:
             x = layer(x, src_mask, rope)
         return self.norm_f(x)
@@ -601,7 +383,6 @@ class Transformer(nn.Module):
         dropout: float = 0.1,
         pad_idx: int = 0,
         rope_theta: float = 10000.0,
-        vision_config: dict = None,
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -611,15 +392,6 @@ class Transformer(nn.Module):
                                 num_kv_heads, max_len, dropout, rope_theta)
         self.decoder = Decoder(tgt_vocab_size, d_model, num_layers, num_heads, d_ff,
                                 num_kv_heads, max_len, dropout, rope_theta)
-
-        # Optional image input: Image -> Encoder, Text -> Decoder (image
-        # captioning). self.decoder and its cross-attention are completely
-        # unchanged by this - from the decoder's point of view it's always
-        # just cross-attending into "whatever self.encoder produced", and it
-        # has never cared whether that came from text tokens or image
-        # patches. See encode()/forward() below. vision_config=None (the
-        # default) builds nothing extra.
-        self.vision = VisionModule(d_model_text=d_model, **vision_config) if vision_config else None
 
         # "Linear" box in the diagram. Softmax is applied only at inference
         # time (see inference.py) - during training we feed raw logits
@@ -647,30 +419,20 @@ class Transformer(nn.Module):
         return pad_mask & subsequent_mask  # broadcasts to (b, 1, t, t)
 
     # ------------------------------ forward ------------------------------ #
-    def forward(self, src: torch.Tensor = None, tgt: torch.Tensor = None,
-                image: torch.Tensor = None) -> torch.Tensor:
-        """src: source token ids, or None for image-only input (pure
-        captioning). image: optional pixel tensor - Image -> Encoder (with
-        src=None), or Image + Text -> Encoder (pass both)."""
-        enc_out, src_mask = self.encode(src, image=image)
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        src_mask = self.make_src_mask(src)
         tgt_mask = self.make_tgt_mask(tgt)
+
+        enc_out = self.encoder(src, src_mask)
         dec_out = self.decoder(tgt, enc_out, src_mask, tgt_mask)
 
         logits = self.linear(dec_out)  # (batch, tgt_len, tgt_vocab_size)
         return logits
 
     # convenience used by inference.py for step-by-step decoding
-    def encode(self, src: torch.Tensor = None, image: torch.Tensor = None):
-        if image is None:
-            src_mask = self.make_src_mask(src)
-            return self.encoder(src, src_mask), src_mask
-
-        image_embeds = self.vision(image)  # (b, n_img, d_model)
-        inputs_embeds, pad_mask_1d = build_multimodal_embeds(
-            self.encoder.embedding, image_embeds, src, self.pad_idx
-        )
-        src_mask = pad_mask_1d.unsqueeze(1).unsqueeze(2)  # (b,1,1,total_len)
-        return self.encoder(src_mask=src_mask, inputs_embeds=inputs_embeds), src_mask
+    def encode(self, src):
+        src_mask = self.make_src_mask(src)
+        return self.encoder(src, src_mask), src_mask
 
     def decode(self, tgt, enc_out, src_mask):
         tgt_mask = self.make_tgt_mask(tgt)
@@ -698,8 +460,7 @@ class GPTStack(nn.Module):
         )
         self.norm_f = RMSNorm(d_model)
 
-    def forward(self, x=None, mask=None, kv_cache=None, use_cache=False, position_offset=0,
-                inputs_embeds=None):
+    def forward(self, x, mask, kv_cache=None, use_cache=False, position_offset=0):
         """
         kv_cache: optional list of per-layer (past_k, past_v) pairs (or None for a
             fresh/prefill call, i.e. no history yet).
@@ -707,14 +468,9 @@ class GPTStack(nn.Module):
             0 on the prefill call, then the running sequence length on every
             single-new-token step after that, so RoPE keeps rotating each new
             token by its true position instead of always starting over at 0.
-        inputs_embeds: precomputed (batch, seq_len, d_model) vectors to use instead
-            of looking x up in the embedding table - e.g. an [image_embeds; text
-            token_embeds] sequence built by build_multimodal_embeds for a prefill
-            call that includes an image. None (default) reproduces the original
-            embedding(x) behavior exactly.
         """
-        h = self.dropout(self.embedding(x) if inputs_embeds is None else inputs_embeds)
-        rope = self.rotary_emb(h.size(1), h.device, h.dtype, offset=position_offset)
+        h = self.dropout(self.embedding(x))
+        rope = self.rotary_emb(x.size(1), h.device, h.dtype, offset=position_offset)
 
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.layers):
@@ -754,7 +510,6 @@ class TransformerDecoderOnly(nn.Module):
         dropout: float = 0.1,
         pad_idx: int = 0,
         rope_theta: float = 10000.0,
-        vision_config: dict = None,
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -763,14 +518,6 @@ class TransformerDecoderOnly(nn.Module):
         self.stack = GPTStack(vocab_size, d_model, num_layers, num_heads, d_ff,
                                num_kv_heads, max_len, dropout, rope_theta)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Optional image input (LLaVA-style: image patch embeddings are
-        # projected into d_model and prepended to the prompt before the
-        # causal stack, see forward()/generate() below). vision_config=None
-        # (the default) builds nothing extra - this is byte-for-byte the
-        # original text-only TransformerDecoderOnly.
-        self.vision = VisionModule(d_model_text=d_model, **vision_config) if vision_config else None
-
         self._init_weights()
 
     def _init_weights(self):
@@ -778,117 +525,63 @@ class TransformerDecoderOnly(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def make_causal_mask(self, x: torch.Tensor = None, past_len: int = 0,
-                          pad_mask_new: torch.Tensor = None) -> torch.Tensor:
-        """Builds the causal (+padding) mask for the *new* chunk being processed
-        this call - the whole prompt (optionally with an image prefix) on a
-        prefill call, a single token on every cached step after that.
-        past_len is how many already-cached positions precede it. Every new
-        query position may attend to *all* past_len cached keys (they're all
-        strictly earlier, so causality is automatically satisfied) plus the
-        usual lower-triangular mask among the new positions themselves.
-        past_len=0 makes this identical to the old tril-only mask.
-
-        pad_mask_new: optional precomputed (batch, new_len) bool "is this
-            position real" mask for the new chunk. Needed instead of the
-            default (x != self.pad_idx) whenever the new chunk includes
-            image tokens, which have no token id to compare against pad_idx
-            in the first place - image positions are always real, so the
-            caller (forward(), below) builds this by concatenating an
-            all-True image mask with the usual text pad mask (see
-            build_multimodal_embeds). Leave None for the original
-            text-only behavior.
-        """
-        batch, new_len = pad_mask_new.shape if pad_mask_new is not None else x.shape
+    def make_causal_mask(self, x: torch.Tensor, past_len: int = 0) -> torch.Tensor:
+        """x here is only the *new* chunk being processed this call - the whole
+        prompt on a prefill call, a single token on every cached step after
+        that. past_len is how many already-cached positions precede it.
+        Every new query position may attend to *all* past_len cached keys
+        (they're all strictly earlier, so causality is automatically
+        satisfied) plus the usual lower-triangular mask among the new
+        positions themselves. past_len=0 makes this identical to the old
+        tril-only mask."""
+        batch, new_len = x.shape
         total_len = past_len + new_len
-        pad_mask = pad_mask_new if pad_mask_new is not None else (x != self.pad_idx)
-        pad_mask = pad_mask.unsqueeze(1).unsqueeze(2)  # (b,1,1,new_len)
+        pad_mask = (x != self.pad_idx).unsqueeze(1).unsqueeze(2)  # (b,1,1,new_len)
         if past_len > 0:
-            device = pad_mask.device
-            past_ok = torch.ones((batch, 1, 1, past_len), dtype=torch.bool, device=device)
+            past_ok = torch.ones((batch, 1, 1, past_len), dtype=torch.bool, device=x.device)
             pad_mask = torch.cat([past_ok, pad_mask], dim=-1)  # (b,1,1,total_len)
 
-        device = pad_mask.device
-        q_pos = torch.arange(past_len, total_len, device=device).unsqueeze(1)  # (new_len,1)
-        k_pos = torch.arange(total_len, device=device).unsqueeze(0)            # (1,total_len)
+        q_pos = torch.arange(past_len, total_len, device=x.device).unsqueeze(1)  # (new_len,1)
+        k_pos = torch.arange(total_len, device=x.device).unsqueeze(0)            # (1,total_len)
         causal = k_pos <= q_pos  # (new_len, total_len) - lower-triangular, shifted by past_len
 
         return pad_mask & causal  # broadcasts to (b, 1, new_len, total_len)
 
-    def forward(self, x: torch.Tensor, image: torch.Tensor = None, kv_cache=None,
-                use_cache: bool = False, past_len: int = 0):
+    def forward(self, x: torch.Tensor, kv_cache=None, use_cache: bool = False, past_len: int = 0):
         """
         x: the new token chunk to process (the full prompt on a prefill call,
             or just the newest token on every step after that).
-        image: optional (batch, channels, img_size, img_size) pixel tensor.
-            Only meaningful on the prefill call (past_len == 0, kv_cache is
-            None) - by the time there's cached history the image has already
-            been folded into it, so pass image=None on every following step
-            (generate() below does this automatically).
         kv_cache / use_cache / past_len: see GPTStack.forward - plumbed straight
             through. Default (kv_cache=None, use_cache=False) is the original
             recompute-everything forward pass, unchanged, still used for training.
         """
-        n_img = 0
-        if image is not None:
-            if self.vision is None:
-                raise ValueError("image was passed but this model was built without "
-                                  "vision_config= - construct with vision_config to accept images.")
-            image_embeds = self.vision(image)                       # (b, n_img, d_model)
-            n_img = image_embeds.size(1)
-            inputs_embeds, pad_mask_new = build_multimodal_embeds(
-                self.stack.embedding, image_embeds, x, self.pad_idx
-            )
-            mask = self.make_causal_mask(past_len=past_len, pad_mask_new=pad_mask_new)
-        else:
-            inputs_embeds, mask = None, self.make_causal_mask(x, past_len=past_len)
-
+        mask = self.make_causal_mask(x, past_len=past_len)
         if use_cache:
             hidden, new_cache = self.stack(x, mask, kv_cache=kv_cache, use_cache=True,
-                                            position_offset=past_len, inputs_embeds=inputs_embeds)
-        else:
-            hidden = self.stack(x, mask, inputs_embeds=inputs_embeds)
-
-        # Image positions have no "next token" target, so skip the (expensive,
-        # vocab-sized) lm_head projection for them entirely rather than
-        # computing and discarding those logits.
-        hidden_for_lm = hidden[:, n_img:, :] if n_img else hidden
-        logits = self.lm_head(hidden_for_lm)  # (batch, text_len, vocab_size)
-
-        if use_cache:
-            return logits, new_cache
-        return logits
+                                            position_offset=past_len)
+            return self.lm_head(hidden), new_cache
+        hidden = self.stack(x, mask)
+        return self.lm_head(hidden)  # (batch, seq_len, vocab_size)
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, image: torch.Tensor = None,
-                 temperature: float = 1.0, top_k: int = None, eos_idx: int = None,
-                 use_cache: bool = True):
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
+                 top_k: int = None, eos_idx: int = None, use_cache: bool = True):
         """Autoregressive sampling loop, one token at a time. Stops early if the
         sequence would exceed this model's positional capacity (max_len - which
         now bounds the RoPE table rather than an additive positional encoding),
         even if eos_idx is never predicted.
 
-        image: optional pixel tensor, e.g. <image> + "Describe this picture."
-            -> idx is the tokenized prompt, image is the picture. Folded into
-            the prompt once on the very first (prefill) forward pass; every
-            token generated after that reuses the image's contribution via
-            the KV-cache exactly like it reuses the prompt's, so it costs
-            nothing extra per generated token.
-
-        use_cache=True (default): the prompt (and image, if any) is run
-        through the model once (the "prefill" step) to seed a KV-cache, then
-        every following step only does a forward pass on the single newest
-        token, reusing cached K/V for every earlier position via the
-        GQA-shrunk cache built above. Cost per step drops from O(seq_len) to
-        O(1), so total generation cost drops from O(seq_len^2) to O(seq_len)
-        attention work.
+        use_cache=True (default): the prompt is run through the model once
+        (the "prefill" step) to seed a KV-cache, then every following step
+        only does a forward pass on the single newest token, reusing cached
+        K/V for every earlier position via the GQA-shrunk cache built above.
+        Cost per step drops from O(seq_len) to O(1), so total generation cost
+        drops from O(seq_len^2) to O(seq_len) attention work.
 
         use_cache=False: the old behavior - recompute the full forward pass
         over the whole sequence-so-far at every step. Kept around mainly to
         sanity-check the cached path (see the __main__ block below) and as a
-        fallback if you ever need it, since it's strictly simpler. Does not
-        support image (the image would have to be re-passed and re-encoded
-        every step for no benefit - just use use_cache=True for image input).
+        fallback if you ever need it, since it's strictly simpler.
         """
         self.eval()
         room = max(0, self.max_len - idx.size(1))
@@ -903,7 +596,6 @@ class TransformerDecoderOnly(nn.Module):
             return torch.multinomial(probs, num_samples=1)
 
         if not use_cache:
-            assert image is None, "generate(use_cache=False) doesn't support image= - use use_cache=True."
             for _ in range(steps):
                 logits = self.forward(idx)
                 next_token = sample(logits)
@@ -915,19 +607,12 @@ class TransformerDecoderOnly(nn.Module):
         kv_cache = None
         past_len = 0
         cur = idx  # first call processes the whole prompt (prefill); after that, just the newest token
-        first_step = True
         for _ in range(steps):
-            step_image = image if first_step else None
-            logits, kv_cache = self.forward(cur, image=step_image, kv_cache=kv_cache,
-                                             use_cache=True, past_len=past_len)
+            logits, kv_cache = self.forward(cur, kv_cache=kv_cache, use_cache=True, past_len=past_len)
             next_token = sample(logits)
-            # The cache now holds cur.size(1) new text positions, plus the
-            # image's token count too on the very first (prefill) step.
-            n_img = self.vision.encoder.pos_embed.size(1) if (first_step and image is not None) else 0
-            past_len += n_img + cur.size(1)
+            past_len += cur.size(1)
             idx = torch.cat([idx, next_token], dim=1)
             cur = next_token
-            first_step = False
             if eos_idx is not None and (next_token == eos_idx).all():
                 break
         return idx
@@ -956,7 +641,6 @@ class TransformerEncoderOnly(nn.Module):
         pooling: str = "mean",  # "mean" or "cls" (assumes token 0 of each sequence is a [CLS]-like token)
         rope_theta: float = 10000.0,
         use_mlm_head: bool = True,
-        vision_config: dict = None,
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -964,13 +648,6 @@ class TransformerEncoderOnly(nn.Module):
         num_kv_heads = num_kv_heads or default_num_kv_heads(num_heads)
         self.encoder = Encoder(vocab_size, d_model, num_layers, num_heads, d_ff,
                                 num_kv_heads, max_len, dropout, rope_theta)
-
-        # Optional image input: Image -> Class, or Image + Text -> Class.
-        # Projected image patch embeddings are concatenated onto the front
-        # of the text sequence (or used alone, with text_ids=None) and run
-        # through the same bidirectional self.encoder above - see forward().
-        # vision_config=None (the default) builds nothing extra.
-        self.vision = VisionModule(d_model_text=d_model, **vision_config) if vision_config else None
 
         # optional heads - leave num_classes=None to just get contextual embeddings back.
         # use_mlm_head=False (pass this whenever a model will only ever be trained/used
@@ -993,25 +670,9 @@ class TransformerEncoderOnly(nn.Module):
     def make_pad_mask(self, x: torch.Tensor) -> torch.Tensor:
         return (x != self.pad_idx).unsqueeze(1).unsqueeze(2)  # (b,1,1,seq_len)
 
-    def forward(self, x: torch.Tensor = None, image: torch.Tensor = None, task: str = "classify"):
-        """
-        x: token ids, or None for image-only input.
-        image: optional pixel tensor - Image -> Class, or Image + Text -> Class
-            (pass both x and image). task="mlm" stays text-only: predicting a
-            masked *vocabulary* token isn't a meaningful operation on an image
-            patch, so mlm ignores image and requires x.
-        """
-        if image is None or task == "mlm":
-            mask = self.make_pad_mask(x)
-            hidden = self.encoder(x, mask)          # (batch, seq_len, d_model)
-            pad_mask_1d = (x != self.pad_idx)
-        else:
-            image_embeds = self.vision(image)        # (b, n_img, d_model)
-            inputs_embeds, pad_mask_1d = build_multimodal_embeds(
-                self.encoder.embedding, image_embeds, x, self.pad_idx
-            )
-            mask = pad_mask_1d.unsqueeze(1).unsqueeze(2)  # (b,1,1,total_len)
-            hidden = self.encoder(src_mask=mask, inputs_embeds=inputs_embeds)
+    def forward(self, x: torch.Tensor, task: str = "classify"):
+        mask = self.make_pad_mask(x)
+        hidden = self.encoder(x, mask)  # (batch, seq_len, d_model)
 
         if task == "embed":
             return hidden
@@ -1026,12 +687,9 @@ class TransformerEncoderOnly(nn.Module):
             raise ValueError("num_classes was not set - construct with num_classes=N to classify.")
 
         if self.pooling == "cls":
-            # position 0 is the ViT's own [CLS] token when an image is
-            # present (VisionEncoder always puts it first), else the usual
-            # text [CLS]-like convention.
             pooled = hidden[:, 0, :]
-        else:  # mean-pool over real (non-pad, non-masked-out) positions
-            pad_mask_2d = pad_mask_1d.unsqueeze(-1).float()  # (b, total_len, 1)
+        else:  # mean-pool over real (non-pad) tokens
+            pad_mask_2d = (x != self.pad_idx).unsqueeze(-1).float()  # (b, seq_len, 1)
             summed = (hidden * pad_mask_2d).sum(dim=1)
             counts = pad_mask_2d.sum(dim=1).clamp(min=1e-6)
             pooled = summed / counts
@@ -1064,7 +722,6 @@ class TransformerRegression(nn.Module):
         num_targets: int = 1,
         pooling: str = "mean",  # "mean" or "cls" (assumes token 0 of each sequence is a [CLS]-like token)
         rope_theta: float = 10000.0,
-        vision_config: dict = None,
     ):
         super().__init__()
         self.pad_idx = pad_idx
@@ -1073,11 +730,6 @@ class TransformerRegression(nn.Module):
         num_kv_heads = num_kv_heads or default_num_kv_heads(num_heads)
         self.encoder = Encoder(vocab_size, d_model, num_layers, num_heads, d_ff,
                                 num_kv_heads, max_len, dropout, rope_theta)
-
-        # Optional image input: Image -> value, or Image + Text -> value.
-        # Same mechanism as TransformerEncoderOnly - see its forward() for
-        # the fuller explanation. vision_config=None builds nothing extra.
-        self.vision = VisionModule(d_model_text=d_model, **vision_config) if vision_config else None
 
         # Plain linear head, no activation - regression targets are unbounded
         # (or standardized to mean 0 / std 1 upstream in data_cleaning.py), so
@@ -1094,29 +746,18 @@ class TransformerRegression(nn.Module):
     def make_pad_mask(self, x: torch.Tensor) -> torch.Tensor:
         return (x != self.pad_idx).unsqueeze(1).unsqueeze(2)  # (b,1,1,seq_len)
 
-    def forward(self, x: torch.Tensor = None, image: torch.Tensor = None, task: str = "regress"):
-        """x: token ids, or None for image-only input. image: optional pixel
-        tensor - Image -> value, or Image + Text -> value (pass both)."""
-        if image is None:
-            mask = self.make_pad_mask(x)
-            hidden = self.encoder(x, mask)  # (batch, seq_len, d_model)
-            pad_mask_1d = (x != self.pad_idx)
-        else:
-            image_embeds = self.vision(image)  # (b, n_img, d_model)
-            inputs_embeds, pad_mask_1d = build_multimodal_embeds(
-                self.encoder.embedding, image_embeds, x, self.pad_idx
-            )
-            mask = pad_mask_1d.unsqueeze(1).unsqueeze(2)
-            hidden = self.encoder(src_mask=mask, inputs_embeds=inputs_embeds)
+    def forward(self, x: torch.Tensor, task: str = "regress"):
+        mask = self.make_pad_mask(x)
+        hidden = self.encoder(x, mask)  # (batch, seq_len, d_model)
 
         if task == "embed":
             return hidden
 
         # task == "regress"
         if self.pooling == "cls":
-            pooled = hidden[:, 0, :]  # ViT's [CLS] token when an image is present, else text position 0
-        else:  # mean-pool over real (non-pad, non-masked-out) positions
-            pad_mask_2d = pad_mask_1d.unsqueeze(-1).float()  # (b, total_len, 1)
+            pooled = hidden[:, 0, :]
+        else:  # mean-pool over real (non-pad) tokens
+            pad_mask_2d = (x != self.pad_idx).unsqueeze(-1).float()  # (b, seq_len, 1)
             summed = (hidden * pad_mask_2d).sum(dim=1)
             counts = pad_mask_2d.sum(dim=1).clamp(min=1e-6)
             pooled = summed / counts
@@ -1167,42 +808,3 @@ if __name__ == "__main__":
                                        num_heads=4, num_kv_heads=2, d_ff=512, num_targets=1)
     preds = regressor(x, task="regress")
     print("TransformerRegression predictions shape:", preds.shape)  # (2, 1)
-
-    # ----------------------------------------------------------------- #
-    # Vision sanity checks - small images/patches so this stays fast.
-    # A model built WITHOUT vision_config is unaffected by any of this
-    # (that's the whole backward-compatibility point); these checks only
-    # exercise the new, opt-in vision_config path.
-    # ----------------------------------------------------------------- #
-    vis_cfg = dict(img_size=32, patch_size=8, d_model_vision=48, num_layers=2, num_heads=4, d_ff=96)
-    img = torch.rand(2, 3, 32, 32)  # (batch, channels, H, W)
-
-    # decoder-only + image: <image> "Describe this picture." -> caption
-    vgpt = TransformerDecoderOnly(vocab_size=1000, d_model=128, num_layers=2, num_heads=4,
-                                   num_kv_heads=2, d_ff=512, vision_config=vis_cfg)
-    prompt_ids = torch.randint(1, 1000, (2, 6))
-    vlogits = vgpt(prompt_ids, image=img)
-    print("TransformerDecoderOnly + image logits shape:", vlogits.shape)  # (2, 6, 1000) - image positions excluded
-    vgen = vgpt.generate(prompt_ids, image=img, max_new_tokens=8, top_k=20)
-    print("TransformerDecoderOnly + image generated shape:", vgen.shape)  # (2, 14)
-
-    # encoder-only classification: image alone, and image+text
-    vbert = TransformerEncoderOnly(vocab_size=1000, d_model=128, num_layers=2, num_heads=4,
-                                    num_kv_heads=2, d_ff=512, num_classes=3, vision_config=vis_cfg)
-    img_only_logits = vbert(image=img, task="classify")
-    img_text_logits = vbert(x=torch.randint(1, 1000, (2, 5)), image=img, task="classify")
-    print("TransformerEncoderOnly image-only / image+text logits shapes:",
-          img_only_logits.shape, img_text_logits.shape)  # (2, 3) (2, 3)
-
-    # encoder-only regression: image alone
-    vregressor = TransformerRegression(vocab_size=1000, d_model=128, num_layers=2, num_heads=4,
-                                        num_kv_heads=2, d_ff=512, num_targets=1, vision_config=vis_cfg)
-    img_preds = vregressor(image=img, task="regress")
-    print("TransformerRegression image-only predictions shape:", img_preds.shape)  # (2, 1)
-
-    # encoder-decoder image captioning: Image -> Encoder, Text -> Decoder
-    vcaptioner = Transformer(src_vocab_size=1000, tgt_vocab_size=1000, d_model=128, num_layers=2,
-                              num_heads=4, num_kv_heads=2, d_ff=512, vision_config=vis_cfg)
-    caption_tgt = torch.randint(1, 1000, (2, 7))
-    cap_logits = vcaptioner(tgt=caption_tgt, image=img)
-    print("Transformer (captioning) logits shape:", cap_logits.shape)  # (2, 7, 1000)
